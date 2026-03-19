@@ -170,7 +170,7 @@ mod tests {
         let samples: Vec<DiskSample> = (0..7)
             .map(|i| DiskSample {
                 mono: i * 6 * 3600,
-                usage_percent: 70 + i as u32,
+                usage_percent: 70 + u32::try_from(i).unwrap_or(0),
                 free_bytes: 1_000_000,
             })
             .collect();

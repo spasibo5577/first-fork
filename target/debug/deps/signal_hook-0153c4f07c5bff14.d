@@ -1,0 +1,11 @@
+A:\cratond\target\debug\deps\signal_hook-0153c4f07c5bff14.d: C:\Users\user\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signal-hook-0.3.18\src\lib.rs C:\Users\user\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signal-hook-0.3.18\src\flag.rs C:\Users\user\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signal-hook-0.3.18\src\low_level\mod.rs C:\Users\user\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signal-hook-0.3.18\src\low_level\channel.rs C:\Users\user\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signal-hook-0.3.18\src\low_level\signal_details.rs
+
+A:\cratond\target\debug\deps\libsignal_hook-0153c4f07c5bff14.rlib: C:\Users\user\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signal-hook-0.3.18\src\lib.rs C:\Users\user\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signal-hook-0.3.18\src\flag.rs C:\Users\user\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signal-hook-0.3.18\src\low_level\mod.rs C:\Users\user\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signal-hook-0.3.18\src\low_level\channel.rs C:\Users\user\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signal-hook-0.3.18\src\low_level\signal_details.rs
+
+A:\cratond\target\debug\deps\libsignal_hook-0153c4f07c5bff14.rmeta: C:\Users\user\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signal-hook-0.3.18\src\lib.rs C:\Users\user\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signal-hook-0.3.18\src\flag.rs C:\Users\user\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signal-hook-0.3.18\src\low_level\mod.rs C:\Users\user\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signal-hook-0.3.18\src\low_level\channel.rs C:\Users\user\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signal-hook-0.3.18\src\low_level\signal_details.rs
+
+C:\Users\user\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signal-hook-0.3.18\src\lib.rs:
+C:\Users\user\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signal-hook-0.3.18\src\flag.rs:
+C:\Users\user\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signal-hook-0.3.18\src\low_level\mod.rs:
+C:\Users\user\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signal-hook-0.3.18\src\low_level\channel.rs:
+C:\Users\user\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signal-hook-0.3.18\src\low_level\signal_details.rs:
