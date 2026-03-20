@@ -2,14 +2,11 @@
 //! isolation, and graceful kill escalation.
 //!
 //! Every external command runs in its own process group (`setpgid`).
-//! On timeout: `SIGTERM` to group → 5s grace → `SIGKILL` to group.
-//!
-//! On Windows (dev), process groups are not used — single process kill only.
+//! On timeout: SIGTERM to group → 5s grace → SIGKILL to group.
 
 use std::io::{self, Read};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
-
 
 /// Outcome of running an external command.
 #[derive(Debug)]
@@ -17,18 +14,20 @@ pub struct ExecResult {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub exit_code: i32,
+    #[allow(dead_code)] // Phase 4: effect result reporting to reducer
     pub duration: Duration,
+    #[allow(dead_code)] // Phase 4: effect result reporting to reducer
     pub killed: bool,
 }
 
 impl ExecResult {
-    /// Returns stdout as a lossy UTF-8 string, trimmed.
+    /// Returns stdout as lossy UTF-8, trimmed.
     #[must_use]
     pub fn stdout_text(&self) -> String {
         String::from_utf8_lossy(&self.stdout).trim().to_string()
     }
 
-    /// Returns stderr as a lossy UTF-8 string, trimmed.
+    /// Returns stderr as lossy UTF-8, trimmed.
     #[must_use]
     pub fn stderr_text(&self) -> String {
         String::from_utf8_lossy(&self.stderr).trim().to_string()
@@ -38,7 +37,7 @@ impl ExecResult {
 /// Runs a command with the given timeout.
 ///
 /// # Errors
-/// Returns an error if the command cannot be started (not found, permission denied).
+/// Returns an error if the command cannot be started.
 /// A non-zero exit code is NOT an error — check `result.exit_code`.
 pub fn run(argv: &[&str], timeout: Duration) -> Result<ExecResult, ExecError> {
     if argv.is_empty() {
@@ -65,7 +64,6 @@ pub fn run(argv: &[&str], timeout: Duration) -> Result<ExecResult, ExecError> {
                 if libc::setpgid(0, 0) != 0 {
                     return Err(io::Error::last_os_error());
                 }
-                // Kill child if parent dies.
                 libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
                 Ok(())
             });
@@ -77,12 +75,10 @@ pub fn run(argv: &[&str], timeout: Duration) -> Result<ExecResult, ExecError> {
         source: e,
     })?;
 
-    // Poll for completion with timeout.
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                // Process exited.
                 let output = collect_output(&mut child);
                 return Ok(ExecResult {
                     stdout: output.0,
@@ -93,11 +89,8 @@ pub fn run(argv: &[&str], timeout: Duration) -> Result<ExecResult, ExecError> {
                 });
             }
             Ok(None) => {
-                // Still running.
                 if Instant::now() >= deadline {
-                    // Timeout — kill.
-                    let result = kill_child(&mut child, start);
-                    return Ok(result);
+                    return Ok(kill_child(&mut child, start));
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
@@ -111,9 +104,7 @@ pub fn run(argv: &[&str], timeout: Duration) -> Result<ExecResult, ExecError> {
     }
 }
 
-/// Runs a command only if not in dry-run mode, or if the command is read-only.
-///
-/// Returns a fake success result for blocked dry-run commands.
+/// Runs a command only if not in dry-run mode, or if read-only.
 pub fn run_dry_aware(
     argv: &[&str],
     timeout: Duration,
@@ -132,12 +123,11 @@ pub fn run_dry_aware(
     run(argv, timeout)
 }
 
-/// Kill a child process with escalation: SIGTERM → wait 5s → SIGKILL.
+/// Kill with escalation: SIGTERM → 5s → SIGKILL.
 fn kill_child(child: &mut std::process::Child, start: Instant) -> ExecResult {
     #[allow(unused_variables)]
     let pid = child.id();
 
-    // Phase 1: SIGTERM to process group.
     #[cfg(unix)]
     {
         #[allow(clippy::cast_possible_wrap)]
@@ -148,10 +138,9 @@ fn kill_child(child: &mut std::process::Child, start: Instant) -> ExecResult {
     }
     #[cfg(not(unix))]
     {
-        let _ = child.kill(); // Windows: just kill it.
+        let _ = child.kill();
     }
 
-    // Wait up to 5 seconds for graceful exit.
     let kill_deadline = Instant::now() + Duration::from_secs(5);
     loop {
         match child.try_wait() {
@@ -171,7 +160,6 @@ fn kill_child(child: &mut std::process::Child, start: Instant) -> ExecResult {
         }
     }
 
-    // Phase 2: SIGKILL.
     #[cfg(unix)]
     {
         #[allow(clippy::cast_possible_wrap)]
@@ -185,7 +173,6 @@ fn kill_child(child: &mut std::process::Child, start: Instant) -> ExecResult {
         let _ = child.kill();
     }
 
-    // Wait for reap.
     let _ = child.wait();
     let output = collect_output(child);
 
@@ -198,7 +185,7 @@ fn kill_child(child: &mut std::process::Child, start: Instant) -> ExecResult {
     }
 }
 
-/// Collects stdout/stderr from a finished child, truncating to 64KB.
+/// Collects stdout/stderr, truncating to 64KB.
 fn collect_output(child: &mut std::process::Child) -> (Vec<u8>, Vec<u8>) {
     const MAX: usize = 64 * 1024;
 
@@ -220,7 +207,6 @@ fn exit_code_from_status(status: ExitStatus) -> i32 {
     {
         use std::os::unix::process::ExitStatusExt;
         status.code().unwrap_or_else(|| {
-            // Killed by signal.
             status.signal().map_or(-1, |s| -s)
         })
     }
@@ -236,13 +222,11 @@ fn is_read_only(argv: &[&str]) -> bool {
         return false;
     }
 
-    // Single-word read-only commands.
     let name = argv[0];
     if matches!(name, "du" | "df" | "free" | "cat" | "journalctl" | "find") {
         return true;
     }
 
-    // Two-word read-only commands.
     if argv.len() >= 2 {
         let key = format!("{} {}", argv[0], argv[1]);
         if matches!(
@@ -264,18 +248,11 @@ fn is_read_only(argv: &[&str]) -> bool {
     false
 }
 
-/// Errors from exec operations.
 #[derive(Debug)]
 pub enum ExecError {
     EmptyArgv,
-    Spawn {
-        cmd: String,
-        source: io::Error,
-    },
-    Wait {
-        cmd: String,
-        source: io::Error,
-    },
+    Spawn { cmd: String, source: io::Error },
+    Wait { cmd: String, source: io::Error },
 }
 
 impl std::fmt::Display for ExecError {
@@ -297,7 +274,6 @@ mod tests {
 
     #[test]
     fn echo_succeeds() {
-        // `echo` exists on both Unix and Windows (via cmd).
         #[cfg(unix)]
         let result = run(&["echo", "hello"], Duration::from_secs(5)).unwrap();
         #[cfg(not(unix))]
@@ -319,8 +295,10 @@ mod tests {
 
     #[test]
     fn empty_argv_errors() {
-        let result = run(&[], Duration::from_secs(1));
-        assert!(matches!(result, Err(ExecError::EmptyArgv)));
+        assert!(matches!(
+            run(&[], Duration::from_secs(1)),
+            Err(ExecError::EmptyArgv)
+        ));
     }
 
     #[test]
@@ -329,12 +307,11 @@ mod tests {
             run_dry_aware(&["systemctl", "restart", "ntfy"], Duration::from_secs(5), true)
                 .unwrap();
         assert_eq!(result.exit_code, 0);
-        assert!(result.duration == Duration::ZERO); // Fake result.
+        assert!(result.duration == Duration::ZERO);
     }
 
     #[test]
     fn dry_run_allows_read_only() {
-        // is_read_only should pass these through.
         assert!(is_read_only(&["systemctl", "is-active", "ntfy"]));
         assert!(is_read_only(&["docker", "info"]));
         assert!(is_read_only(&["journalctl", "-u", "ntfy"]));

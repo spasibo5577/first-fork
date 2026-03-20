@@ -1,10 +1,7 @@
-//! Core domain types for the entire CRATON system.
+//! Core domain types for the CRATON system.
 //!
-//! Every enum here must be exhaustively matched everywhere it is used.
+//! Every enum here must be exhaustively matched.
 //! Adding a variant is a compile-time breaking change — by design.
-//!
-//! Naming: types use full English names, no abbreviations.
-//! Serialization: `serde` with `rename_all = "snake_case"` for JSON compatibility.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -13,9 +10,6 @@ use std::time::Duration;
 // ─── Service identity ───────────────────────────────────────────
 
 /// Opaque service identifier. Cheap to clone, cheap to compare.
-/// Wrapping a `String` gives us type safety over raw strings:
-/// a function accepting `ServiceId` cannot accidentally receive
-/// a unit name or a URL.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ServiceId(pub String);
@@ -38,13 +32,9 @@ impl std::fmt::Display for ServiceId {
 /// Identifies a resource that can be leased for exclusive access.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum ResourceId {
-    /// A specific service instance.
     Service(ServiceId),
-    /// The Docker daemon itself.
     DockerDaemon,
-    /// The restic backup repository.
     BackupRepo,
-    /// Disk cleanup operations.
     DiskCleanup,
 }
 
@@ -65,13 +55,11 @@ impl std::fmt::Display for ResourceId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceKind {
-    /// Native systemd unit (e.g., unbound, ntfy).
+    /// Native systemd unit.
     Systemd,
-    /// Docker container wrapped in a systemd unit (e.g., continuwuity).
-    /// Key difference: if this fails, Docker daemon health is checked.
+    /// Docker container wrapped in a systemd unit.
     DockerSystemd,
-        /// Virtual node representing infrastructure (e.g., `docker_daemon`).
-    /// Not a real service — used as a dependency graph root.
+    /// Virtual node for dependency graph (e.g. `docker_daemon`).
     Virtual,
 }
 
@@ -81,16 +69,13 @@ pub enum ServiceKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Severity {
-    /// One restart attempt, default alert, no incident report.
     Info,
-    /// Two restart attempts, high alert, no Docker escalation.
     Warning,
-    /// Three restart attempts, urgent alert, Docker escalation, incident report.
     Critical,
 }
 
 impl Severity {
-    /// Maximum number of restart attempts before giving up.
+    /// Maximum restart attempts before giving up.
     #[must_use]
     pub const fn max_restart_attempts(self) -> u32 {
         match self {
@@ -100,7 +85,8 @@ impl Severity {
         }
     }
 
-    /// Whether Docker daemon restart is attempted if individual restart fails.
+    /// Whether Docker daemon restart is allowed on escalation.
+    #[allow(dead_code)] // wired in Phase 4: recovery escalation gating
     #[must_use]
     pub const fn allows_docker_escalation(self) -> bool {
         matches!(self, Self::Critical)
@@ -123,7 +109,6 @@ pub enum ProbeSpec {
         url: String,
         #[serde(default = "default_probe_timeout")]
         timeout_secs: u64,
-        /// Expected HTTP status code. Default: 200.
         #[serde(default = "default_http_status")]
         expect_status: u16,
     },
@@ -135,7 +120,6 @@ pub enum ProbeSpec {
         timeout_secs: u64,
     },
     SystemdActive {
-        /// If empty, uses the service's `unit` field.
         #[serde(default)]
         unit: String,
     },
@@ -143,7 +127,6 @@ pub enum ProbeSpec {
         argv: Vec<String>,
         #[serde(default = "default_probe_timeout")]
         timeout_secs: u64,
-        /// Optional stdout validation.
         #[serde(default)]
         expect_stdout: Option<StdoutCheck>,
     },
@@ -151,6 +134,7 @@ pub enum ProbeSpec {
 
 impl ProbeSpec {
     /// Returns the timeout for this probe as a `Duration`.
+    #[allow(dead_code)] // wired in Phase 4: probe scheduling with unified timeout
     #[must_use]
     pub fn timeout(&self) -> Duration {
         let secs = match self {
@@ -167,11 +151,8 @@ impl ProbeSpec {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StdoutCheck {
-    /// Stdout must contain this substring.
     Contains { pattern: String },
-    /// Stdout must NOT contain this substring.
     NotContains { pattern: String },
-    /// Parse stdout as JSON and check a field via JSON pointer.
     JsonField { pointer: String, expected: String },
 }
 
@@ -212,8 +193,7 @@ impl ProbeResult {
     }
 }
 
-/// Structured error from a probe — not a string, because we want
-/// to make decisions based on error class, not parse error text.
+/// Structured probe error — decisions are based on error class, not text.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProbeError {
@@ -233,142 +213,66 @@ impl std::fmt::Display for ProbeError {
             Self::Timeout => f.write_str("timeout"),
             Self::HttpStatus { code } => write!(f, "HTTP {code}"),
             Self::DnsFailure { message } => write!(f, "DNS: {message}"),
-            Self::ExecFailed { exit_code, stderr } => {
-                write!(f, "exit {exit_code}: {stderr}")
-            }
+            Self::ExecFailed { exit_code, stderr } => write!(f, "exit {exit_code}: {stderr}"),
             Self::UnexpectedOutput { detail } => write!(f, "unexpected output: {detail}"),
-            Self::DependencyUnavailable { root } => {
-                write!(f, "dependency unavailable: {root}")
-            }
+            Self::DependencyUnavailable { root } => write!(f, "dependency unavailable: {root}"),
         }
     }
-}
-
-// ─── Service state FSM ─────────────────────────────────────────
-
-/// The operational state of a single service as determined by the reducer.
-/// This is NOT a health check result — it's the recovery engine's
-/// assessment after considering dependencies, breaker state, etc.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub enum ServiceState {
-    /// Service is healthy. No action needed.
-    Healthy,
-    /// Service failed health check but hasn't exhausted recovery attempts.
-    Degraded {
-        consecutive_failures: u32,
-    },
-    /// Service failed and recovery was attempted but unsuccessful.
-    Failed {
-        last_error: String,
-    },
-    /// Recovery is in progress right now.
-    Recovering {
-        attempt: u32,
-    },
-    /// Service itself may be fine, but a dependency is down.
-    /// Recovery is suppressed to avoid wasted restarts.
-    BlockedByDependency {
-        root: ServiceId,
-    },
-    /// Circuit breaker tripped — too many restarts in window.
-    Suppressed {
-        until_epoch_secs: u64,
-    },
-    /// Operator or AI explicitly marked as maintenance.
-    InMaintenance {
-        until_epoch_secs: u64,
-        reason: String,
-    },
-    /// No data yet (initial state before first probe).
-    Unknown,
 }
 
 // ─── Circuit breaker ───────────────────────────────────────────
 
 /// Per-service circuit breaker state.
+///
+/// State transitions are managed by `breaker::record_restart`,
+/// `breaker::on_healthy_probe`, and `breaker::maybe_transition`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum BreakerState {
-    /// Normal operation — recovery is allowed.
     Closed,
-    /// Recovery suppressed until the given monotonic instant.
     Open {
-        /// Seconds since an arbitrary monotonic epoch.
         until_mono_secs: u64,
         trip_count: u32,
     },
-    /// Cooldown expired — one probe attempt allowed to test recovery.
     HalfOpen {
         probe_attempt: u32,
         previous_trip_count: u32,
     },
 }
 
-impl BreakerState {
-    /// Returns `true` if recovery actions are currently allowed.
-    #[must_use]
-    pub fn allows_recovery(&self, now_mono_secs: u64) -> bool {
-        match self {
-            Self::Closed | Self::HalfOpen { .. } => true,
-            Self::Open { until_mono_secs, .. } => now_mono_secs >= *until_mono_secs,
-        }
-    }
-}
-
 // ─── Backup FSM ────────────────────────────────────────────────
 
-/// Backup lifecycle phases. Each variant carries the data needed
-/// for crash recovery: if the daemon dies and restarts, it reads
-/// the persisted `BackupPhase` and knows exactly what to clean up.
+/// Backup lifecycle phases. Each variant carries crash-recovery data.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "phase", rename_all = "snake_case")]
 pub enum BackupPhase {
-    /// No backup in progress.
     Idle,
-
-    /// Lock acquired, about to start.
     Locked {
         run_id: String,
     },
-
-    /// Running `restic unlock` to clear stale locks.
     ResticUnlocking {
         run_id: String,
     },
-
-    /// Stopping services that must be offline during backup.
     ServicesStopping {
         run_id: String,
-        /// Snapshot of services that were running BEFORE we stopped them.
-        /// On crash recovery, we restore exactly these — nothing more.
+        /// Services that were running BEFORE backup. On crash, restore exactly these.
         pre_backup_state: Vec<ServiceSnapshot>,
     },
-
-    /// `restic backup` is executing.
     ResticRunning {
         run_id: String,
         pre_backup_state: Vec<ServiceSnapshot>,
     },
-
-    /// Starting services back up after backup.
     ServicesStarting {
         run_id: String,
         remaining: Vec<ServiceRestore>,
     },
-
-    /// Verifying that restarted services pass health checks.
     ServicesVerifying {
         run_id: String,
         started: Vec<ServiceId>,
     },
-
-    /// Running `restic forget --prune` for retention policy.
     RetentionRunning {
         run_id: String,
     },
-
-    /// Running `restic check` for integrity verification.
     Verifying {
         run_id: String,
     },
@@ -380,7 +284,6 @@ impl BackupPhase {
         matches!(self, Self::Idle)
     }
 
-    /// Whether crash recovery should attempt to start stopped services.
     #[must_use]
     pub fn needs_service_recovery(&self) -> bool {
         matches!(
@@ -392,7 +295,6 @@ impl BackupPhase {
         )
     }
 
-    /// Whether crash recovery should run `restic unlock`.
     #[must_use]
     pub fn needs_restic_unlock(&self) -> bool {
         matches!(
@@ -401,7 +303,6 @@ impl BackupPhase {
         )
     }
 
-    /// Extract pre-backup service state for crash compensation.
     #[must_use]
     pub fn pre_backup_services(&self) -> Option<&[ServiceSnapshot]> {
         match self {
@@ -435,34 +336,28 @@ pub struct ServiceRestore {
 
 // ─── Events ────────────────────────────────────────────────────
 
-/// Every input to the reducer. The control loop receives these
-/// from various sources and feeds them into `reduce()`.
+/// Every input to the reducer.
 #[derive(Debug, Clone)]
 pub enum Event {
     /// Scheduler determined these tasks are due.
-    Tick {
-        due_tasks: Vec<TaskKind>,
-    },
+    Tick { due_tasks: Vec<TaskKind> },
 
-    /// Health probes completed for all services.
+    /// Health probes completed.
     ProbeResults(Vec<ProbeResult>),
 
     /// An effect (external command) completed.
-    EffectCompleted {
-        cmd_id: u64,
-        result: EffectResult,
-    },
+    /// Constructed by effect executor, fed back into reducer.
+    #[allow(dead_code)] // Phase 4: effect loop closure
+    EffectCompleted { cmd_id: u64, result: EffectResult },
 
-    /// An HTTP API request that requires mutation.
+    /// HTTP API request requiring state mutation.
     HttpCommand(CommandRequest),
 
     /// OS signal received.
     Signal(SignalKind),
 
     /// Daemon just started — run crash recovery.
-    StartupRecovery {
-        persisted_backup: BackupPhase,
-    },
+    StartupRecovery { persisted_backup: BackupPhase },
 }
 
 /// Kinds of scheduled tasks.
@@ -478,38 +373,36 @@ pub enum TaskKind {
 }
 
 /// Result of executing an external command.
+/// Constructed by the effect executor and fed back via `Event::EffectCompleted`.
+#[allow(dead_code)] // Phase 4: effect worker constructs these from ExecResult
 #[derive(Debug, Clone)]
 pub enum EffectResult {
-    /// Command succeeded.
     Success {
         stdout: String,
         stderr: String,
         duration_ms: u64,
     },
-    /// Command failed with exit code.
     Failed {
         exit_code: i32,
         stdout: String,
         stderr: String,
         duration_ms: u64,
     },
-    /// Command was killed (timeout or signal).
     Killed {
         signal: i32,
         duration_ms: u64,
     },
-    /// Exec helper process itself failed.
     HelperError {
         message: String,
     },
 }
 
-/// Commands that can arrive from the HTTP API.
+/// Commands arriving from the HTTP API.
+/// Constructed by HTTP handler, consumed by `reduce::handle_http_command`.
+#[allow(dead_code)] // Phase 4: HTTP remediation endpoint + reducer handler
 #[derive(Debug, Clone)]
 pub enum CommandRequest {
-    /// Manual task trigger (e.g., POST /trigger/backup).
     Trigger(TaskKind),
-    /// AI remediation request.
     Remediate {
         action: RemediationAction,
         target: Option<ServiceId>,
@@ -521,14 +414,17 @@ pub enum CommandRequest {
 /// OS signals the daemon handles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignalKind {
+    #[allow(dead_code)] // constructed in signal.rs under #[cfg(unix)]
     Shutdown,
+    #[allow(dead_code)] // constructed in signal.rs under #[cfg(unix)]
     Reload,
 }
 
-// ─── Commands (output of reducer) ──────────────────────────────
+// ─── Commands (reducer output) ─────────────────────────────────
 
-/// Every output from the reducer. The effect executor receives
-/// these and performs real-world side effects.
+/// Every output from the reducer. Effect executor performs these.
+/// Not all variants are emitted yet — the enum defines the complete protocol.
+#[allow(dead_code)] // Protocol enum: variants wired incrementally across phases
 #[derive(Debug, Clone)]
 pub enum Command {
     // ── Service management ──
@@ -616,7 +512,6 @@ pub enum Command {
 
 // ─── Alert ─────────────────────────────────────────────────────
 
-/// A structured alert that the notifier renders into NTFY format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Alert {
     pub title: String,
@@ -636,7 +531,6 @@ pub enum AlertPriority {
 }
 
 impl AlertPriority {
-    /// NTFY wire format value.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -651,11 +545,13 @@ impl AlertPriority {
 
 // ─── Cleanup level ─────────────────────────────────────────────
 
+/// Disk cleanup aggressiveness.
+#[allow(dead_code)] // Phase 4: constructed by disk policy
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CleanupLevel {
-    /// apt clean + journal vacuum.
+    /// `apt clean` + journal vacuum.
     Standard,
-    /// Standard + docker image prune -a (only if safe).
+    /// Standard + `docker image prune -a` (only if safe).
     Aggressive,
 }
 

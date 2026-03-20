@@ -2,7 +2,7 @@
 //!
 //! Architecture: single consumer thread reads from a bounded channel.
 //! Producers call `queue()` (non-blocking) from any thread.
-//! Failed deliveries are logged to stderr (captured by journald).
+//! Failed deliveries are logged to stderr (captured by `journald`).
 
 use crate::model::Alert;
 use sha2::{Digest, Sha256};
@@ -20,7 +20,7 @@ pub struct NotifyConfig {
     pub queue_size: usize,
 }
 
-/// Handle for queueing notifications. Clone-able, thread-safe (via mpsc::Sender).
+/// Handle for queueing notifications. Clone-able, thread-safe (via `mpsc::Sender`).
 #[derive(Clone)]
 pub struct NotifySender {
     tx: mpsc::SyncSender<Alert>,
@@ -41,16 +41,13 @@ impl NotifySender {
     }
 }
 
-/// Creates a notifier pair: sender (for producers) and the consumer runner.
+/// Creates a notifier pair: sender (for producers) and consumer runner.
 ///
-/// The consumer must be started in a dedicated thread via `run_consumer()`.
+/// The consumer must be started in a dedicated thread via `consumer.run()`.
 #[must_use]
 pub fn create(config: NotifyConfig) -> (NotifySender, NotifyConsumer) {
     let (tx, rx) = mpsc::sync_channel(config.queue_size);
-    (
-        NotifySender { tx },
-        NotifyConsumer { rx, config },
-    )
+    (NotifySender { tx }, NotifyConsumer { rx, config })
 }
 
 /// Consumer side of the notifier. Runs in its own thread.
@@ -61,12 +58,7 @@ pub struct NotifyConsumer {
 
 impl NotifyConsumer {
     /// Runs the consumer loop. Blocks until the channel is closed.
-    ///
-    /// Call this in a dedicated thread:
-    /// ```ignore
-    /// std::thread::spawn(move || consumer.run());
-    /// ```
-        pub fn run(self) {
+    pub fn run(self) {
         let mut dedup = DedupCache::new(self.config.dedup_ttl);
         let mut sent_count: u64 = 0;
         let mut failed_count: u64 = 0;
@@ -85,14 +77,12 @@ impl NotifyConsumer {
                 return;
             };
 
-            // Dedup check.
             let key = dedup_key(&alert);
             if dedup.is_duplicate(&key) {
                 dedup_count += 1;
                 continue;
             }
 
-            // Attempt delivery with retries.
             let mut delivered = false;
             for (attempt, delay) in self.config.retries.iter().enumerate() {
                 if delay.as_secs() > 0 || delay.as_millis() > 0 {
@@ -128,7 +118,6 @@ impl NotifyConsumer {
     }
 }
 
-/// Sends a single notification to NTFY via raw HTTP POST.
 fn send_ntfy(url: &str, alert: &Alert) -> Result<(), String> {
     let parsed = parse_ntfy_url(url).ok_or_else(|| format!("invalid NTFY URL: {url}"))?;
 
@@ -163,7 +152,6 @@ fn send_ntfy(url: &str, alert: &Alert) -> Result<(), String> {
         .write_all(request.as_bytes())
         .map_err(|e| format!("write: {e}"))?;
 
-    // Read response status.
     let mut buf = [0u8; 256];
     let n = std::io::Read::read(&mut stream, &mut buf).map_err(|e| format!("read: {e}"))?;
     let resp = String::from_utf8_lossy(&buf[..n]);
@@ -213,7 +201,6 @@ fn dedup_key(alert: &Alert) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// Simple bounded dedup cache with TTL.
 struct DedupCache {
     entries: HashMap<String, Instant>,
     ttl: Duration,
@@ -312,7 +299,5 @@ mod tests {
             priority: AlertPriority::Default,
             tags: String::new(),
         });
-
-        // Just verify it doesn't panic. Actual delivery tested via integration.
     }
 }

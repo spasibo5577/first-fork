@@ -1,21 +1,20 @@
 //! Resource lease arbiter for mutual exclusion of conflicting operations.
 //!
-//! Simple, in-memory, no persistence. Leases are lost on restart —
-//! which is correct because all operations are also lost on restart.
-//!
-//! Not thread-safe — owned by the control loop.
+//! In-memory, no persistence. Leases lost on restart — correct because
+//! all in-flight operations are also lost on restart.
 
 use crate::model::ResourceId;
 use std::collections::BTreeMap;
 
 /// Tracks which resources are currently held and by whom.
+#[allow(dead_code)] // Phase 4: wired via AcquireLease/ReleaseLease commands
 #[derive(Debug)]
 pub struct LeaseArbiter {
     held: BTreeMap<ResourceId, LeaseEntry>,
-    /// Maximum duration a lease can be held before auto-expiry (safety net).
     max_ttl_secs: u64,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct LeaseEntry {
     holder: String,
@@ -23,18 +22,16 @@ struct LeaseEntry {
 }
 
 /// Result of trying to acquire a lease.
+#[allow(dead_code)] // Phase 4: lease conflict handling
 #[derive(Debug, PartialEq, Eq)]
 pub enum AcquireResult {
-    /// Lease acquired successfully.
     Granted,
-    /// Resource already held by another holder.
     Conflict { current_holder: String },
-    /// Expired lease was evicted, new lease granted.
     GrantedAfterEviction { previous_holder: String },
 }
 
+#[allow(dead_code)] // Phase 4: lease management
 impl LeaseArbiter {
-    /// Creates a new arbiter with the given maximum TTL for any lease.
     #[must_use]
     pub fn new(max_ttl_secs: u64) -> Self {
         Self {
@@ -43,11 +40,6 @@ impl LeaseArbiter {
         }
     }
 
-    /// Attempts to acquire a lease on a resource.
-    ///
-    /// `now_mono_secs` is the current monotonic time in seconds.
-    ///
-    /// If the same holder already holds the lease, this is a no-op (idempotent).
     pub fn acquire(
         &mut self,
         resource: ResourceId,
@@ -55,12 +47,10 @@ impl LeaseArbiter {
         now_mono_secs: u64,
     ) -> AcquireResult {
         if let Some(entry) = self.held.get(&resource) {
-            // Same holder — idempotent.
             if entry.holder == holder {
                 return AcquireResult::Granted;
             }
 
-            // Check if existing lease expired.
             let age = now_mono_secs.saturating_sub(entry.acquired_mono_secs);
             if age >= self.max_ttl_secs {
                 let previous = entry.holder.clone();
@@ -91,10 +81,6 @@ impl LeaseArbiter {
         AcquireResult::Granted
     }
 
-    /// Releases a lease on a resource.
-    ///
-    /// If the resource is not held, or held by a different holder, this is a no-op.
-    /// Returns `true` if the lease was actually released.
     pub fn release(&mut self, resource: &ResourceId, holder: &str) -> bool {
         if let Some(entry) = self.held.get(resource) {
             if entry.holder == holder {
@@ -105,13 +91,11 @@ impl LeaseArbiter {
         false
     }
 
-    /// Checks if a resource is currently held (and by whom).
     #[must_use]
     pub fn holder(&self, resource: &ResourceId) -> Option<&str> {
         self.held.get(resource).map(|e| e.holder.as_str())
     }
 
-    /// Returns `true` if the resource is free (not held or expired).
     #[must_use]
     pub fn is_free(&self, resource: &ResourceId, now_mono_secs: u64) -> bool {
         match self.held.get(resource) {
@@ -123,7 +107,6 @@ impl LeaseArbiter {
         }
     }
 
-    /// Evicts all expired leases. Called periodically by control loop.
     pub fn evict_expired(&mut self, now_mono_secs: u64) {
         self.held.retain(|_resource, entry| {
             let age = now_mono_secs.saturating_sub(entry.acquired_mono_secs);
@@ -131,7 +114,6 @@ impl LeaseArbiter {
         });
     }
 
-    /// Returns how many leases are currently held (including expired).
     #[must_use]
     pub fn held_count(&self) -> usize {
         self.held.len()
@@ -191,7 +173,7 @@ mod tests {
 
     #[test]
     fn expired_lease_evicted() {
-        let mut arb = LeaseArbiter::new(100); // 100 second TTL
+        let mut arb = LeaseArbiter::new(100);
         let r = ResourceId::DockerDaemon;
 
         arb.acquire(r.clone(), "old_holder", 0);
@@ -228,9 +210,6 @@ mod tests {
         assert_eq!(arb.held_count(), 3);
 
         arb.evict_expired(100);
-        // "a" at t=0, ttl=100, age=100 → expired
-        // "b" at t=50, ttl=100, age=50 → alive
-        // "c" at t=90, ttl=100, age=10 → alive
         assert_eq!(arb.held_count(), 2);
     }
 }

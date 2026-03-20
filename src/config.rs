@@ -1,11 +1,9 @@
 //! TOML configuration with strict validation.
 //!
 //! Design: one `#[derive(Deserialize)]` struct tree that maps
-//! directly to the TOML file. Validation happens after parsing,
-//! not during — this gives better error messages.
+//! directly to the TOML file. Validation happens after parsing.
 //!
-//! Unknown fields cause a hard error (serde `deny_unknown_fields`).
-//! This catches typos in config files at startup, not in production.
+//! Unknown fields cause a hard error (`deny_unknown_fields`).
 
 use crate::model::{ProbeSpec, ServiceId, ServiceKind, Severity};
 use serde::Deserialize;
@@ -25,8 +23,9 @@ pub struct CratonConfig {
     pub disk: DiskConfig,
 
     #[serde(default = "default_updates")]
+    #[allow(dead_code)] // Phase 4: update scheduling
     pub updates: UpdatesConfig,
-
+    
     #[serde(default = "default_ai")]
     pub ai: AiConfig,
 
@@ -45,7 +44,6 @@ impl CratonConfig {
 
     /// Validates internal consistency after parsing.
     fn validate(&self) -> Result<(), ConfigError> {
-        // At least one service.
         if self.services.is_empty() {
             return Err(ConfigError::Validation(
                 "no services defined".to_string(),
@@ -63,7 +61,7 @@ impl CratonConfig {
             }
         }
 
-        // Validate dependency references.
+        // Dependency references.
         let known: std::collections::HashSet<&ServiceId> =
             self.services.iter().map(|s| &s.id).collect();
         for svc in &self.services {
@@ -85,7 +83,6 @@ impl CratonConfig {
             )));
         }
 
-        // Backup repo and password must be set.
         if self.backup.restic_repo.is_empty() {
             return Err(ConfigError::Validation(
                 "backup.restic_repo is empty".to_string(),
@@ -96,8 +93,6 @@ impl CratonConfig {
                 "backup.restic_password_file is empty".to_string(),
             ));
         }
-
-        // NTFY URL must be set.
         if self.ntfy.url.is_empty() {
             return Err(ConfigError::Validation(
                 "ntfy.url is empty".to_string(),
@@ -122,6 +117,8 @@ impl CratonConfig {
 
 // ─── Sub-configs ───────────────────────────────────────────────
 
+/// Daemon-level settings (listen address, watchdog, logging).
+#[allow(dead_code)] // fields parsed from TOML, consumed as runtime wiring completes
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonConfig {
@@ -142,6 +139,8 @@ pub struct NtfyConfig {
     pub retries: Vec<u64>,
 }
 
+/// Backup configuration — restic paths, schedule, retention.
+#[allow(dead_code)] // fields consumed by backup executor in Phase 4
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BackupConfig {
@@ -157,11 +156,12 @@ pub struct BackupConfig {
     pub verify: bool,
     #[serde(default = "default_verify_subset")]
     pub verify_subset_percent: u32,
-    /// Paths to include in the backup.
     #[serde(default)]
     pub paths: Vec<String>,
 }
 
+/// Restic retention policy (forget --keep-*).
+#[allow(dead_code)] // consumed by `ResticForget` command construction
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RetentionConfig {
@@ -173,6 +173,8 @@ pub struct RetentionConfig {
     pub monthly: u32,
 }
 
+/// Disk monitoring thresholds and prediction toggle.
+#[allow(dead_code)] // consumed by disk policy in Phase 4
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DiskConfig {
@@ -186,6 +188,8 @@ pub struct DiskConfig {
     pub predictive: bool,
 }
 
+/// Update check schedules.
+#[allow(dead_code)] // consumed by update scheduling in Phase 4
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdatesConfig {
@@ -195,6 +199,8 @@ pub struct UpdatesConfig {
     pub docker_schedule: String,
 }
 
+/// AI/PicoClaw integration settings.
+#[allow(dead_code)] // consumed by AI bridge in Phase 4
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AiConfig {
@@ -211,6 +217,7 @@ pub struct AiConfig {
 // ─── Service entry ─────────────────────────────────────────────
 
 /// One `[[service]]` block in the TOML config.
+#[allow(dead_code)] // all fields parsed; some consumed in later phases
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceEntry {
@@ -477,8 +484,7 @@ topic = "test"
 restic_repo = "/repo"
 restic_password_file = "/pass"
 "#;
-        let result = CratonConfig::from_toml(toml);
-        assert!(result.is_err());
+        assert!(CratonConfig::from_toml(toml).is_err());
     }
 
     #[test]
@@ -502,8 +508,7 @@ depends_on = ["nonexistent"]
 [service.probe]
 type = "systemd_active"
 "#;
-        let result = CratonConfig::from_toml(toml);
-        assert!(result.is_err());
+        assert!(CratonConfig::from_toml(toml).is_err());
     }
 
     #[test]
@@ -535,8 +540,7 @@ kind = "systemd"
 [service.probe]
 type = "systemd_active"
 "#;
-        let result = CratonConfig::from_toml(toml);
-        assert!(result.is_err());
+        assert!(CratonConfig::from_toml(toml).is_err());
     }
 
     #[test]
@@ -563,8 +567,7 @@ kind = "systemd"
 [service.probe]
 type = "systemd_active"
 "#;
-        let result = CratonConfig::from_toml(toml);
-        assert!(result.is_err());
+        assert!(CratonConfig::from_toml(toml).is_err());
     }
 
     #[test]

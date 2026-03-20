@@ -1,8 +1,8 @@
 //! Circuit breaker — pure functions for state transitions.
 //!
-//! The breaker protects against restart storms. When a service
-//! is restarted too many times within a window, the breaker
-//! trips (`Open`) and suppresses further restarts until cooldown.
+//! Protects against restart storms. When a service is restarted
+//! too many times within a window, the breaker trips (`Open`)
+//! and suppresses further restarts until cooldown.
 //!
 //! States: `Closed` → `Open` → `HalfOpen` → `Closed`.
 
@@ -10,8 +10,8 @@ use crate::model::BreakerState;
 
 /// Records a restart attempt. Returns the new breaker state.
 ///
-/// If `restarts_in_window >= threshold` and the breaker is `Closed`,
-/// it transitions to `Open`.
+/// If `restarts_in_window >= threshold` and breaker is `Closed`,
+/// transitions to `Open`.
 #[must_use]
 pub fn record_restart(
     breaker: &BreakerState,
@@ -34,14 +34,10 @@ pub fn record_restart(
         BreakerState::HalfOpen {
             previous_trip_count,
             ..
-        } => {
-            // Restart during half-open means the probe attempt failed.
-            // Re-open with incremented trip count.
-            BreakerState::Open {
-                until_mono_secs: now_mono + cooldown_secs,
-                trip_count: previous_trip_count + 1,
-            }
-        }
+        } => BreakerState::Open {
+            until_mono_secs: now_mono + cooldown_secs,
+            trip_count: previous_trip_count + 1,
+        },
         BreakerState::Open { .. } => breaker.clone(),
     }
 }
@@ -55,8 +51,7 @@ pub fn on_healthy_probe(breaker: &BreakerState) -> BreakerState {
     }
 }
 
-/// Checks if the breaker should transition from `Open` → `HalfOpen`.
-/// Call this before making recovery decisions.
+/// Checks if breaker should transition `Open` → `HalfOpen` (cooldown expired).
 #[must_use]
 pub fn maybe_transition(breaker: &BreakerState, now_mono: u64) -> BreakerState {
     match breaker {
@@ -82,7 +77,8 @@ pub fn allows_recovery(breaker: &BreakerState, now_mono: u64) -> bool {
     }
 }
 
-/// Explicitly resets the breaker to `Closed` (e.g., operator action).
+/// Explicitly resets the breaker to `Closed` (operator/remediation action).
+#[allow(dead_code)] // Phase 4: ClearBreaker remediation action
 #[must_use]
 pub fn reset() -> BreakerState {
     BreakerState::Closed
@@ -142,7 +138,13 @@ mod tests {
             },
             100,
         );
-        assert!(matches!(b, BreakerState::HalfOpen { previous_trip_count: 1, .. }));
+        assert!(matches!(
+            b,
+            BreakerState::HalfOpen {
+                previous_trip_count: 1,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -186,12 +188,10 @@ mod tests {
 
     #[test]
     fn trip_count_increments() {
-        // Start: Open with trip_count=2
         let b1 = BreakerState::Open {
             until_mono_secs: 100,
             trip_count: 2,
         };
-        // Cooldown expires → HalfOpen (carries previous_trip_count=2)
         let b2 = maybe_transition(&b1, 100);
         assert!(matches!(
             b2,
@@ -200,7 +200,6 @@ mod tests {
                 ..
             }
         ));
-        // Restart during HalfOpen → Open with trip_count=3
         let b3 = record_restart(&b2, 1, 3, 3600, 200);
         match b3 {
             BreakerState::Open { trip_count, .. } => assert_eq!(trip_count, 3),

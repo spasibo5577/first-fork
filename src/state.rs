@@ -16,6 +16,8 @@ const MAX_DISK_SAMPLES: usize = 14;
 const MAX_REMEDIATION_LOG: usize = 50;
 
 /// All mutable state for the daemon. Owned by the control loop thread.
+/// Fields are consumed incrementally as runtime wiring completes.
+#[allow(dead_code)] // fields wired across phases
 #[derive(Debug)]
 pub struct State {
     pub services: BTreeMap<ServiceId, SvcState>,
@@ -72,6 +74,8 @@ impl State {
         }
     }
 
+    /// Allocates a unique command ID for effect tracking.
+    #[allow(dead_code)] // Phase 4: effect command tracking
     pub fn alloc_cmd_id(&mut self) -> u64 {
         let id = self.next_cmd_id;
         self.next_cmd_id += 1;
@@ -79,12 +83,14 @@ impl State {
     }
 }
 
+/// Per-service runtime state.
 #[derive(Debug, Clone)]
 pub struct SvcState {
     pub status: ServiceStatus,
     pub breaker: BreakerState,
     pub restart_history: RingBuf<RestartRecord>,
     pub last_restart_mono: Option<u64>,
+    #[allow(dead_code)] // Phase 4: alert dedup cooldown
     pub last_alert_mono: Option<u64>,
     pub maintenance: Option<Maintenance>,
 }
@@ -121,6 +127,8 @@ impl SvcState {
     }
 }
 
+/// Service status as determined by the reducer after considering
+/// probes, dependencies, breaker state, and maintenance.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ServiceStatus {
@@ -128,6 +136,7 @@ pub enum ServiceStatus {
     Healthy {
         since_mono: u64,
     },
+    #[allow(dead_code)] // Phase 4: set when consecutive failures tracked
     Unhealthy {
         since_mono: u64,
         error: String,
@@ -144,6 +153,7 @@ pub enum ServiceStatus {
     BlockedByDep {
         root: ServiceId,
     },
+    #[allow(dead_code)] // Phase 4: set when breaker trips → suppress
     Suppressed {
         until_mono: u64,
     },

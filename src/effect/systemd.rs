@@ -2,14 +2,11 @@
 //!
 //! Protocol: send text messages to the Unix datagram socket
 //! specified by `NOTIFY_SOCKET` environment variable.
-//!
-//! On Windows (dev): all operations are silent no-ops.
 
 #[cfg(unix)]
 use std::os::unix::net::UnixDatagram;
 
 /// Handle for sending notifications to systemd.
-/// If `NOTIFY_SOCKET` is not set, all methods are no-ops.
 pub struct SdNotify {
     #[cfg(unix)]
     socket: Option<UnixDatagram>,
@@ -34,9 +31,7 @@ impl SdNotify {
                 }
             };
 
-            // Remove from env so child processes don't inherit.
             std::env::remove_var("NOTIFY_SOCKET");
-
             let socket = UnixDatagram::unbound().ok();
 
             Self { socket, path }
@@ -76,36 +71,30 @@ impl SdNotify {
         let _ = socket.send_to(msg.as_bytes(), &self.path);
     }
 
-    /// Signal that the daemon is ready.
     pub fn ready(&self) {
         self.notify("READY=1");
     }
 
-    /// Send watchdog keepalive.
     pub fn watchdog(&self) {
         self.notify("WATCHDOG=1");
     }
 
-    /// Signal that the daemon is stopping.
     pub fn stopping(&self) {
         self.notify("STOPPING=1");
     }
 
-    /// Set human-readable status.
     pub fn status(&self, status: &str) {
         self.notify(&format!("STATUS={status}"));
     }
 }
 
-/// Returns the recommended watchdog ping interval, if configured.
-///
-/// Reads `WATCHDOG_USEC` from environment. Returns half the interval
-/// as recommended by systemd documentation.
+/// Returns recommended watchdog ping interval from `WATCHDOG_USEC`.
+/// Returns half the interval as recommended by systemd docs.
+#[allow(dead_code)] // Phase 4: adaptive watchdog interval
 #[must_use]
 pub fn watchdog_interval() -> Option<std::time::Duration> {
     let usec: u64 = std::env::var("WATCHDOG_USEC").ok()?.parse().ok()?;
 
-    // Check WATCHDOG_PID if set.
     if let Ok(pid_str) = std::env::var("WATCHDOG_PID") {
         if let Ok(pid) = pid_str.parse::<u32>() {
             if pid != std::process::id() {

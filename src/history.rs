@@ -1,18 +1,14 @@
 //! Generic bounded ring buffer for event histories.
 //!
-//! Used for recovery events, backup results, disk samples,
-//! remediation log, and restart tracking. One implementation,
-//! not five copy-pasted ones.
+//! One implementation for recovery events, backup results, disk samples,
+//! remediation log, and restart tracking.
 
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
-/// A bounded FIFO buffer that evicts the oldest entry when full.
+/// Bounded FIFO buffer that evicts the oldest entry when full.
 ///
-/// `N` is the compile-time maximum capacity. At runtime the buffer
-/// never allocates beyond `N` entries.
-///
-/// Not thread-safe — designed to be owned by the control loop.
+/// Not thread-safe — owned by the control loop.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct RingBuf<T> {
@@ -41,61 +37,12 @@ impl<T> RingBuf<T> {
         self.items.push_back(item);
     }
 
-    /// Returns a slice of all items, oldest first.
-    #[must_use]
-    pub fn as_slice(&self) -> &[T] {
-        // VecDeque may not be contiguous. make_contiguous is &mut,
-        // so we provide iteration instead.
-        // For serialization, we go through iter().
-        // For direct slice access, callers should use `iter()`.
-        // This is a known limitation — see `iter()` below.
-
-        // Actually, we can provide a slice if the deque is contiguous.
-        // After push-only usage (no pop_back), VecDeque is always
-        // contiguous when it hasn't wrapped. But we can't guarantee this.
-        // Use `iter()` instead.
-        let (a, b) = self.items.as_slices();
-        if b.is_empty() {
-            a
-        } else {
-            // Fallback: this only happens if the internal ring has wrapped.
-            // In practice with push+pop_front pattern, this is common.
-            // Callers needing a contiguous slice should use `to_vec()`.
-            a // Return first half — imprecise. Use iter() for full access.
-        }
-    }
-
-    /// Returns an iterator over all items, oldest first.
+    /// Iterator over all items, oldest first.
     pub fn iter(&self) -> impl Iterator<Item = &T> {
         self.items.iter()
     }
 
-    /// Returns the number of items currently stored.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.items.len()
-    }
-
-    /// Returns true if no items are stored.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
-    }
-
-    /// Returns the maximum capacity.
-    #[must_use]
-    pub fn capacity(&self) -> usize {
-        self.max_size
-    }
-
-    /// Returns the last N items as a `Vec`, most recent last.
-    #[must_use]
-    pub fn last_n(&self, n: usize) -> Vec<&T> {
-        let skip = self.items.len().saturating_sub(n);
-        self.items.iter().skip(skip).collect()
-    }
-
-    /// Copies all items to a Vec, oldest first.
+    /// Copies all items to a `Vec`, oldest first.
     #[must_use]
     pub fn to_vec(&self) -> Vec<T>
     where
@@ -103,18 +50,43 @@ impl<T> RingBuf<T> {
     {
         self.items.iter().cloned().collect()
     }
+}
+
+/// Collection utility methods — standard API, used in tests,
+/// consumed by Phase 4 runtime (history endpoints, diagnostics).
+#[allow(dead_code)]
+impl<T> RingBuf<T> {
+    /// Number of items currently stored.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Returns true if empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Maximum capacity.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.max_size
+    }
+
+    /// Last N items as references, most recent last.
+    #[must_use]
+    pub fn last_n(&self, n: usize) -> Vec<&T> {
+        let skip = self.items.len().saturating_sub(n);
+        self.items.iter().skip(skip).collect()
+    }
 
     /// Clears all items.
     pub fn clear(&mut self) {
         self.items.clear();
     }
-}
 
-/// Custom deserialization: after loading, we must restore `max_size`
-/// since it's `#[serde(skip)]`. Callers should use `with_max_size()`
-/// after deserialization if the default is wrong.
-impl<T> RingBuf<T> {
-    /// Sets the max size after deserialization. Truncates if needed.
+    /// Sets max size after deserialization. Truncates if needed.
     pub fn set_max_size(&mut self, max_size: usize) {
         self.max_size = max_size;
         while self.items.len() > max_size {

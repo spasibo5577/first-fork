@@ -1,19 +1,21 @@
 //! Disk monitoring decisions — pure logic.
+//!
+//! Evaluates disk usage against thresholds and provides OLS-based
+//! prediction for trend alerting.
 
 use crate::model::CleanupLevel;
 use crate::state::DiskSample;
 
 /// What to do based on current disk usage.
+#[allow(dead_code)] // Phase 4: disk monitoring wiring
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiskDecision {
-    /// Disk usage is fine.
     Ok,
-    /// Warning threshold exceeded — run standard cleanup.
     Warning { usage_percent: u32 },
-    /// Critical threshold exceeded — run aggressive cleanup.
     Critical { usage_percent: u32 },
 }
 
+#[allow(dead_code)] // Phase 4: disk monitoring wiring
 impl DiskDecision {
     #[must_use]
     pub fn cleanup_level(&self) -> Option<CleanupLevel> {
@@ -26,6 +28,7 @@ impl DiskDecision {
 }
 
 /// Evaluates disk usage against thresholds.
+#[allow(dead_code)] // Phase 4: disk monitoring wiring
 #[must_use]
 pub fn evaluate(usage_percent: u32, warn: u32, critical: u32) -> DiskDecision {
     if usage_percent >= critical {
@@ -39,14 +42,14 @@ pub fn evaluate(usage_percent: u32, warn: u32, critical: u32) -> DiskDecision {
 
 /// OLS linear regression for disk usage prediction.
 ///
-/// Returns `(predicted_24h_percent, slope_per_hour, r_squared)`.
 /// Returns `None` if insufficient data (< 3 samples).
-#[must_use]
 #[allow(
+    dead_code,
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss
 )]
+#[must_use]
 pub fn predict(samples: &[DiskSample], horizon_hours: f64) -> Option<DiskPrediction> {
     let n = samples.len();
     if n < 3 {
@@ -82,7 +85,6 @@ pub fn predict(samples: &[DiskSample], horizon_hours: f64) -> Option<DiskPredict
     let slope = num / den;
     let intercept = mean_y - slope * mean_x;
 
-    // R²
     let mut ss_res = 0.0_f64;
     let mut ss_tot = 0.0_f64;
     for i in 0..n {
@@ -98,8 +100,7 @@ pub fn predict(samples: &[DiskSample], horizon_hours: f64) -> Option<DiskPredict
     };
 
     let current_hours = xs.last().copied().unwrap_or(0.0);
-    let predicted = (intercept + slope * (current_hours + horizon_hours))
-        .clamp(0.0, 100.0);
+    let predicted = (intercept + slope * (current_hours + horizon_hours)).clamp(0.0, 100.0);
 
     Some(DiskPrediction {
         predicted_24h_percent: predicted.round() as u32,
@@ -110,6 +111,7 @@ pub fn predict(samples: &[DiskSample], horizon_hours: f64) -> Option<DiskPredict
 }
 
 /// Result of disk prediction.
+#[allow(dead_code)] // Phase 4: disk prediction alerting
 #[derive(Debug, Clone)]
 pub struct DiskPrediction {
     pub predicted_24h_percent: u32,
@@ -118,6 +120,7 @@ pub struct DiskPrediction {
     pub sample_count: usize,
 }
 
+#[allow(dead_code)]
 impl DiskPrediction {
     #[must_use]
     pub fn confidence(&self) -> &'static str {
@@ -143,30 +146,45 @@ mod tests {
 
     #[test]
     fn warning_at_threshold() {
-        assert_eq!(evaluate(85, 85, 95), DiskDecision::Warning { usage_percent: 85 });
+        assert_eq!(
+            evaluate(85, 85, 95),
+            DiskDecision::Warning {
+                usage_percent: 85
+            }
+        );
     }
 
     #[test]
     fn critical_at_threshold() {
-        assert_eq!(evaluate(95, 85, 95), DiskDecision::Critical { usage_percent: 95 });
+        assert_eq!(
+            evaluate(95, 85, 95),
+            DiskDecision::Critical {
+                usage_percent: 95
+            }
+        );
     }
 
     #[test]
     fn cleanup_levels() {
         assert!(DiskDecision::Ok.cleanup_level().is_none());
         assert_eq!(
-            DiskDecision::Warning { usage_percent: 86 }.cleanup_level(),
+            DiskDecision::Warning {
+                usage_percent: 86
+            }
+            .cleanup_level(),
             Some(CleanupLevel::Standard)
         );
         assert_eq!(
-            DiskDecision::Critical { usage_percent: 96 }.cleanup_level(),
+            DiskDecision::Critical {
+                usage_percent: 96
+            }
+            .cleanup_level(),
             Some(CleanupLevel::Aggressive)
         );
     }
 
     #[test]
     fn prediction_linear_growth() {
-        // Simulate disk growing 1% per 6 hours.
         let samples: Vec<DiskSample> = (0..7)
             .map(|i| DiskSample {
                 mono: i * 6 * 3600,
@@ -176,12 +194,9 @@ mod tests {
             .collect();
 
         let pred = predict(&samples, 24.0).unwrap();
-        // Slope ~= 1/6 per hour ≈ 0.17
         assert!(pred.slope_per_hour > 0.1);
         assert!(pred.slope_per_hour < 0.25);
-        // R² should be very high for perfectly linear data.
         assert!(pred.r_squared > 0.99);
-        // Prediction should be higher than current.
         assert!(pred.predicted_24h_percent > 76);
         assert_eq!(pred.confidence(), "high");
     }
@@ -189,8 +204,16 @@ mod tests {
     #[test]
     fn prediction_insufficient_data() {
         let samples = vec![
-            DiskSample { mono: 0, usage_percent: 50, free_bytes: 1_000_000 },
-            DiskSample { mono: 3600, usage_percent: 51, free_bytes: 990_000 },
+            DiskSample {
+                mono: 0,
+                usage_percent: 50,
+                free_bytes: 1_000_000,
+            },
+            DiskSample {
+                mono: 3600,
+                usage_percent: 51,
+                free_bytes: 990_000,
+            },
         ];
         assert!(predict(&samples, 24.0).is_none());
     }
