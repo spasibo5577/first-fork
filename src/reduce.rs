@@ -6,12 +6,14 @@
 use crate::config::CratonConfig;
 use crate::graph::DepGraph;
 use crate::model::{
-    Alert, AlertPriority, BackupPhase, Command, CommandRequest, Event,
-    IncidentKind, IncidentReport, ResourceId, ServiceId, SignalKind, TaskKind,
+    Alert, AlertPriority, BackupPhase, Command, CommandRequest, EffectResult, Event, IncidentKind,
+    IncidentReport, RemediationAction, ResourceId, ServiceId, SignalKind, TaskKind,
 };
 use crate::policy::{backup, recovery};
 use crate::schedule::WallClock;
-use crate::state::{RecoveryRecord, RestartRecord, ServiceStatus, State};
+use crate::state::{
+    BackupRecord, RecoveryRecord, RemediationRecord, RestartRecord, ServiceStatus, State,
+};
 use std::collections::BTreeMap;
 
 /// Context provided by the runtime to the reducer on each call.
@@ -47,6 +49,8 @@ pub fn reduce(
     }
 }
 
+// ─── Tick ──────────────────────────────────────────────────────
+
 fn handle_tick(
     state: &mut State,
     due_tasks: &[TaskKind],
@@ -75,6 +79,7 @@ fn handle_tick(
             TaskKind::DiskMonitor => {
                 state.last_disk_mono = Some(ctx.mono_secs);
                 cmds.push(Command::CheckDiskUsage);
+                cmds.extend(evaluate_disk(state, config));
             }
             TaskKind::AptUpdates => {
                 state.last_apt_day = Some(ctx.wall.day);
@@ -86,13 +91,15 @@ fn handle_tick(
             }
             TaskKind::DailySummary => {
                 state.last_summary_day = Some(ctx.wall.day);
-                cmds.push(Command::PublishSnapshot);
+                cmds.extend(build_daily_summary(state, config));
             }
         }
     }
 
     cmds
 }
+
+// ─── Probes ────────────────────────────────────────────────────
 
 fn handle_probes(
     state: &mut State,
@@ -107,7 +114,15 @@ fn handle_probes(
     let mut recovered = Vec::new();
     let mut failed = Vec::new();
 
-    apply_decisions(state, &plan, config, ctx, &mut cmds, &mut recovered, &mut failed);
+    apply_decisions(
+        state,
+        &plan,
+        config,
+        ctx,
+        &mut cmds,
+        &mut recovered,
+        &mut failed,
+    );
     emit_alerts(&plan, &recovered, &failed, &mut cmds);
 
     state.recovery_history.push(RecoveryRecord {
@@ -156,6 +171,14 @@ fn apply_decisions(
                 attempt,
                 severity: _,
             } => {
+                // Lease check: don't restart if resource is held.
+                if !state
+                    .leases
+                    .is_free(&ResourceId::Service(sid.clone()), ctx.mono_secs)
+                {
+                    continue;
+                }
+
                 svc.status = ServiceStatus::Recovering {
                     attempt: *attempt,
                     since_mono: ctx.mono_secs,
@@ -244,7 +267,14 @@ fn emit_alerts(
     }
 }
 
+// ─── Backup ────────────────────────────────────────────────────
+
 fn start_backup(state: &mut State, config: &CratonConfig, ctx: &Ctx) -> Vec<Command> {
+    // Lease check.
+    if !state.leases.is_free(&ResourceId::BackupRepo, ctx.mono_secs) {
+        return vec![];
+    }
+
     let run_id = format!("backup-{}", ctx.mono_secs);
 
     state.backup_phase = BackupPhase::Locked {
@@ -261,44 +291,511 @@ fn start_backup(state: &mut State, config: &CratonConfig, ctx: &Ctx) -> Vec<Comm
         Command::ResticUnlock,
     ];
 
-    for svc in config.backup_stop_services() {
+    // Stop services that need to be offline during backup.
+    let stop_svcs = config.backup_stop_services();
+    let pre_backup_state: Vec<crate::model::ServiceSnapshot> = stop_svcs
+        .iter()
+        .map(|svc| {
+            let is_healthy = state
+                .services
+                .get(&svc.id)
+                .is_some_and(|s| s.status.is_healthy());
+            crate::model::ServiceSnapshot {
+                id: svc.id.clone(),
+                was_running: is_healthy,
+                unit: svc.unit.clone(),
+            }
+        })
+        .collect();
+
+    for svc in &stop_svcs {
         cmds.push(Command::AcquireLease {
             resource: ResourceId::Service(svc.id.clone()),
             holder: run_id.clone(),
         });
+        cmds.push(Command::StopService {
+            id: svc.id.clone(),
+            unit: svc.unit.clone(),
+            reason: "backup".into(),
+        });
     }
 
-    state.backup_phase = BackupPhase::ResticUnlocking {
-        run_id,
+    state.backup_phase = BackupPhase::ResticRunning {
+        run_id: run_id.clone(),
+        pre_backup_state: pre_backup_state.clone(),
     };
+
     cmds.push(Command::PersistBackupState(state.backup_phase.clone()));
+    cmds.push(Command::ResticBackup {
+        paths: config.backup.paths.clone(),
+    });
 
     cmds
 }
 
+// ─── Effect completed ──────────────────────────────────────────
+
 fn handle_effect_completed(
-    _state: &mut State,
-    _cmd_id: u64,
-    _result: &crate::model::EffectResult,
-    _config: &CratonConfig,
-    _ctx: &Ctx,
+    state: &mut State,
+    cmd_id: u64,
+    result: &EffectResult,
+    config: &CratonConfig,
+    ctx: &Ctx,
 ) -> Vec<Command> {
+    // Check if this is a backup-related completion.
+    if state.backup_pending_cmd == Some(cmd_id) {
+        state.backup_pending_cmd = None;
+        return handle_backup_effect(state, result, config, ctx);
+    }
+
     vec![Command::NotifyWatchdog]
 }
 
-fn handle_http_command(
-    _state: &mut State,
-    _req: CommandRequest,
-    _config: &CratonConfig,
-    _ctx: &Ctx,
+fn handle_backup_effect(
+    state: &mut State,
+    result: &EffectResult,
+    config: &CratonConfig,
+    ctx: &Ctx,
 ) -> Vec<Command> {
-    vec![]
+    let mut cmds = Vec::new();
+    let success = matches!(result, EffectResult::Success { .. });
+
+    match &state.backup_phase {
+        BackupPhase::ResticRunning {
+            run_id,
+            pre_backup_state,
+        } => {
+            if success {
+                state.consecutive_backup_failures = 0;
+
+                // Start services back.
+                let run_id = run_id.clone();
+                let pre = pre_backup_state.clone();
+
+                for snap in &pre {
+                    if snap.was_running {
+                        cmds.push(Command::StartService {
+                            id: snap.id.clone(),
+                            unit: snap.unit.clone(),
+                        });
+                        cmds.push(Command::ReleaseLease {
+                            resource: ResourceId::Service(snap.id.clone()),
+                        });
+                    }
+                }
+                state.backup_phase = BackupPhase::RetentionRunning {
+                    run_id: run_id.clone(),
+                };
+                cmds.push(Command::PersistBackupState(state.backup_phase.clone()));
+                cmds.push(Command::ResticForget {
+                    daily: config.backup.retention.daily,
+                    weekly: config.backup.retention.weekly,
+                    monthly: config.backup.retention.monthly,
+                });
+            } else {
+                cmds.extend(handle_backup_failure(state, result, config, ctx));
+            }
+        }
+        BackupPhase::RetentionRunning { run_id } => {
+            let run_id = run_id.clone();
+
+            if success {
+                if config.backup.verify {
+                    state.backup_phase = BackupPhase::Verifying {
+                        run_id: run_id.clone(),
+                    };
+                    cmds.push(Command::PersistBackupState(state.backup_phase.clone()));
+                    cmds.push(Command::ResticCheck {
+                        subset_percent: config.backup.verify_subset_percent,
+                    });
+                } else {
+                    cmds.extend(finalize_backup(state, true, None, ctx));
+                }
+            } else {
+                cmds.extend(handle_backup_failure(state, result, config, ctx));
+            }
+        }
+        BackupPhase::Verifying { .. } => {
+            let error = if success {
+                None
+            } else {
+                Some(effect_error_message(result))
+            };
+            cmds.extend(finalize_backup(state, success, error, ctx));
+        }
+        _ => {}
+    }
+
+    cmds
 }
+
+fn handle_backup_failure(
+    state: &mut State,
+    result: &EffectResult,
+    _config: &CratonConfig,
+    ctx: &Ctx,
+) -> Vec<Command> {
+    state.consecutive_backup_failures += 1;
+    let error = effect_error_message(result);
+
+    let mut cmds = Vec::new();
+
+    // Restore services from pre_backup_state.
+    if let Some(pre) = state.backup_phase.pre_backup_services() {
+        let pre_owned: Vec<_> = pre.to_vec();
+        for snap in &pre_owned {
+            if snap.was_running {
+                cmds.push(Command::StartService {
+                    id: snap.id.clone(),
+                    unit: snap.unit.clone(),
+                });
+                cmds.push(Command::ReleaseLease {
+                    resource: ResourceId::Service(snap.id.clone()),
+                });
+            }
+        }
+    }
+
+    cmds.extend(finalize_backup(state, false, Some(error), ctx));
+
+    if state.consecutive_backup_failures >= 3 {
+        cmds.push(Command::WriteIncident(IncidentReport {
+            kind: IncidentKind::BackupFailed,
+            service: None,
+            timestamp_epoch_secs: ctx.mono_secs,
+            details: BTreeMap::from([(
+                "consecutive_failures".into(),
+                state.consecutive_backup_failures.to_string(),
+            )]),
+        }));
+    }
+
+    cmds
+}
+
+fn finalize_backup(
+    state: &mut State,
+    success: bool,
+    error: Option<String>,
+    ctx: &Ctx,
+) -> Vec<Command> {
+    state.backup_phase = BackupPhase::Idle;
+
+    let alert = if success {
+        Alert {
+            title: "✅ Backup завершён".into(),
+            body: "Резервное копирование выполнено успешно".into(),
+            priority: AlertPriority::Default,
+            tags: "white_check_mark".into(),
+        }
+    } else {
+        Alert {
+            title: "❌ Backup не удался".into(),
+            body: format!(
+                "Ошибка: {}\nПодряд неудач: {}",
+                error.as_deref().unwrap_or("unknown"),
+                state.consecutive_backup_failures
+            ),
+            priority: AlertPriority::High,
+            tags: "x".into(),
+        }
+    };
+
+    state.backup_history.push(BackupRecord {
+        mono: ctx.mono_secs,
+        success,
+        partial: false,
+        error,
+        duration_secs: 0,
+    });
+
+    vec![
+        Command::PersistBackupState(BackupPhase::Idle),
+        Command::ReleaseLease {
+            resource: ResourceId::BackupRepo,
+        },
+        Command::SendAlert(alert),
+        Command::PublishSnapshot,
+    ]
+}
+
+fn effect_error_message(result: &EffectResult) -> String {
+    match result {
+        EffectResult::Failed {
+            exit_code, stderr, ..
+        } => format!("exit {exit_code}: {stderr}"),
+        EffectResult::Killed { signal, .. } => format!("killed by signal {signal}"),
+        EffectResult::HelperError { message } => message.clone(),
+        EffectResult::Success { .. } => "success".into(),
+    }
+}
+
+// ─── HTTP commands ─────────────────────────────────────────────
+
+fn handle_http_command(
+    state: &mut State,
+    req: CommandRequest,
+    config: &CratonConfig,
+    ctx: &Ctx,
+) -> Vec<Command> {
+    match req {
+        CommandRequest::Trigger(task) => handle_tick(state, &[task], config, ctx),
+        CommandRequest::Remediate {
+            action,
+            target,
+            source,
+            reason,
+        } => handle_remediation(
+            state,
+            &action,
+            target.as_ref(),
+            &source,
+            &reason,
+            config,
+            ctx,
+        ),
+    }
+}
+
+fn handle_remediation(
+    state: &mut State,
+    action: &RemediationAction,
+    target: Option<&ServiceId>,
+    source: &str,
+    reason: &str,
+    config: &CratonConfig,
+    ctx: &Ctx,
+) -> Vec<Command> {
+    let mut cmds = Vec::new();
+
+    let result_str = match action {
+        RemediationAction::RestartService => {
+            let Some(sid) = target else {
+                record_remediation(state, action, target, source, "rejected: no target", ctx);
+                return vec![];
+            };
+            let Some(svc_config) = config.find_service(sid) else {
+                record_remediation(
+                    state,
+                    action,
+                    target,
+                    source,
+                    "rejected: unknown service",
+                    ctx,
+                );
+                return vec![];
+            };
+            cmds.push(Command::RestartService {
+                id: sid.clone(),
+                unit: svc_config.unit.clone(),
+                reason: format!("remediation from {source}: {reason}"),
+            });
+            "executed"
+        }
+        RemediationAction::DockerRestart => {
+            cmds.push(Command::RestartDockerDaemon {
+                reason: format!("remediation from {source}: {reason}"),
+            });
+            "executed"
+        }
+        RemediationAction::ResticUnlock => {
+            cmds.push(Command::ResticUnlock);
+            "executed"
+        }
+        RemediationAction::TriggerBackup => {
+            cmds.extend(handle_tick(state, &[TaskKind::Backup], config, ctx));
+            "triggered"
+        }
+        RemediationAction::ClearBreaker => {
+            let Some(sid) = target else {
+                record_remediation(state, action, target, source, "rejected: no target", ctx);
+                return vec![];
+            };
+            if let Some(svc) = state.services.get_mut(sid) {
+                svc.breaker = crate::breaker::reset();
+            }
+            "executed"
+        }
+        RemediationAction::MarkMaintenance => {
+            let Some(sid) = target else {
+                record_remediation(state, action, target, source, "rejected: no target", ctx);
+                return vec![];
+            };
+            if let Some(svc) = state.services.get_mut(sid) {
+                svc.maintenance = Some(crate::state::Maintenance {
+                    until_mono: ctx.mono_secs + 3600, // 1 hour default
+                    reason: reason.to_string(),
+                });
+            }
+            cmds.push(Command::PersistMaintenance);
+            "executed"
+        }
+        RemediationAction::ClearMaintenance => {
+            let Some(sid) = target else {
+                record_remediation(state, action, target, source, "rejected: no target", ctx);
+                return vec![];
+            };
+            if let Some(svc) = state.services.get_mut(sid) {
+                svc.maintenance = None;
+            }
+            cmds.push(Command::PersistMaintenance);
+            "executed"
+        }
+        RemediationAction::ClearFlapping => {
+            let Some(sid) = target else {
+                record_remediation(state, action, target, source, "rejected: no target", ctx);
+                return vec![];
+            };
+            if let Some(svc) = state.services.get_mut(sid) {
+                svc.breaker = crate::breaker::reset();
+                svc.restart_history.clear();
+            }
+            "executed"
+        }
+        RemediationAction::RunDiskCleanup => {
+            cmds.push(Command::RunDiskCleanup {
+                level: crate::model::CleanupLevel::Standard,
+            });
+            "executed"
+        }
+    };
+
+    record_remediation(state, action, target, source, result_str, ctx);
+    cmds
+}
+
+fn record_remediation(
+    state: &mut State,
+    action: &RemediationAction,
+    target: Option<&ServiceId>,
+    source: &str,
+    result: &str,
+    ctx: &Ctx,
+) {
+    state.remediation_log.push(RemediationRecord {
+        mono: ctx.mono_secs,
+        action: format!("{action:?}"),
+        target: target.cloned(),
+        source: source.to_string(),
+        result: result.to_string(),
+        error: None,
+    });
+}
+
+// ─── Disk evaluation ───────────────────────────────────────────
+
+fn evaluate_disk(state: &State, config: &CratonConfig) -> Vec<Command> {
+    let Some(usage) = state.disk_usage_percent else {
+        return vec![];
+    };
+
+    let decision = crate::policy::disk::evaluate(
+        usage,
+        config.disk.warn_percent,
+        config.disk.critical_percent,
+    );
+
+    let mut cmds = Vec::new();
+
+    if let Some(level) = decision.cleanup_level() {
+        cmds.push(Command::RunDiskCleanup { level });
+    }
+
+    match &decision {
+        crate::policy::disk::DiskDecision::Warning { usage_percent } => {
+            let free = state.disk_free_bytes.unwrap_or(0);
+            cmds.push(Command::SendAlert(Alert {
+                title: "⚠️ Диск заполняется".into(),
+                body: format!(
+                    "Использование: {usage_percent}%\nСвободно: {}\nЗапущена стандартная очистка",
+                    crate::effect::disk::human_bytes(free)
+                ),
+                priority: AlertPriority::High,
+                tags: "warning".into(),
+            }));
+        }
+        crate::policy::disk::DiskDecision::Critical { usage_percent } => {
+            let free = state.disk_free_bytes.unwrap_or(0);
+            cmds.push(Command::SendAlert(Alert {
+                title: "🔴 Диск критически заполнен".into(),
+                body: format!(
+                    "Использование: {usage_percent}%\nСвободно: {}\nЗапущена агрессивная очистка",
+                    crate::effect::disk::human_bytes(free)
+                ),
+                priority: AlertPriority::Urgent,
+                tags: "rotating_light".into(),
+            }));
+        }
+        crate::policy::disk::DiskDecision::Ok => {}
+    }
+
+    cmds
+}
+
+// ─── Daily summary ─────────────────────────────────────────────
+
+fn build_daily_summary(state: &State, config: &CratonConfig) -> Vec<Command> {
+    use std::fmt::Write;
+
+    let mut body = String::with_capacity(512);
+
+    // Services status.
+    let _ = writeln!(body, "📊 Сервисы:");
+    for svc in &config.services {
+        let status = state.services.get(&svc.id).map_or("❌", |s| {
+            if s.status.is_healthy() {
+                "✅"
+            } else {
+                "❌"
+            }
+        });
+        let _ = writeln!(body, "  {status} {}", svc.name);
+    }
+
+    // Disk.
+    if let Some(usage) = state.disk_usage_percent {
+        let free = state.disk_free_bytes.unwrap_or(0);
+        let _ = writeln!(
+            body,
+            "\n💾 Диск: {usage}% занято, {} свободно",
+            crate::effect::disk::human_bytes(free)
+        );
+    }
+
+    // Backup.
+    let last_backup = state.backup_history.iter().last();
+    match last_backup {
+        Some(b) if b.success => {
+            let _ = writeln!(body, "\n📦 Последний backup: ✅ успешно");
+        }
+        Some(b) => {
+            let err = b.error.as_deref().unwrap_or("unknown");
+            let _ = writeln!(body, "\n📦 Последний backup: ❌ {err}");
+        }
+        None => {
+            let _ = writeln!(body, "\n📦 Backup: нет данных");
+        }
+    }
+
+    vec![
+        Command::SendAlert(Alert {
+            title: "📋 Ежедневная сводка".into(),
+            body,
+            priority: AlertPriority::Min,
+            tags: "memo".into(),
+        }),
+        Command::PublishSnapshot,
+    ]
+}
+
+// ─── Shutdown ──────────────────────────────────────────────────
 
 fn handle_shutdown(state: &mut State) -> Vec<Command> {
     state.shutting_down = true;
     vec![Command::Shutdown { grace_secs: 90 }]
 }
+
+// ─── Startup recovery ──────────────────────────────────────────
 
 fn handle_startup_recovery(state: &mut State, persisted: &BackupPhase) -> Vec<Command> {
     let actions = backup::crash_compensation(persisted);
@@ -336,6 +833,8 @@ fn handle_startup_recovery(state: &mut State, persisted: &BackupPhase) -> Vec<Co
 
     cmds
 }
+
+// ─── Tests ─────────────────────────────────────────────────────
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -551,5 +1050,141 @@ url = "http://localhost:8080/v1/health"
         );
 
         assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn http_trigger_emits_commands() {
+        let config = test_config();
+        let graph = DepGraph::build(&config.services).unwrap();
+        let mut state = State::new(&config, 0);
+        let ctx = test_ctx(300);
+
+        let cmds = reduce(
+            &mut state,
+            Event::HttpCommand(CommandRequest::Trigger(TaskKind::Recovery)),
+            &config,
+            &graph,
+            &ctx,
+        );
+
+        assert!(cmds.iter().any(|c| matches!(c, Command::RunProbes(_))));
+    }
+
+    #[test]
+    fn remediation_restart_service() {
+        let config = test_config();
+        let graph = DepGraph::build(&config.services).unwrap();
+        let mut state = State::new(&config, 0);
+        let ctx = test_ctx(300);
+
+        let cmds = reduce(
+            &mut state,
+            Event::HttpCommand(CommandRequest::Remediate {
+                action: RemediationAction::RestartService,
+                target: Some(ServiceId("ntfy".into())),
+                source: "picoclaw".into(),
+                reason: "test".into(),
+            }),
+            &config,
+            &graph,
+            &ctx,
+        );
+
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, Command::RestartService { id, .. } if id.as_str() == "ntfy")));
+        assert!(!state.remediation_log.is_empty());
+    }
+
+    #[test]
+    fn remediation_clear_breaker() {
+        let config = test_config();
+        let graph = DepGraph::build(&config.services).unwrap();
+        let mut state = State::new(&config, 0);
+
+        // Trip the breaker.
+        state
+            .services
+            .get_mut(&ServiceId("ntfy".into()))
+            .unwrap()
+            .breaker = crate::model::BreakerState::Open {
+            until_mono_secs: 9999,
+            trip_count: 2,
+        };
+
+        let ctx = test_ctx(300);
+        let _cmds = reduce(
+            &mut state,
+            Event::HttpCommand(CommandRequest::Remediate {
+                action: RemediationAction::ClearBreaker,
+                target: Some(ServiceId("ntfy".into())),
+                source: "operator".into(),
+                reason: "manual reset".into(),
+            }),
+            &config,
+            &graph,
+            &ctx,
+        );
+
+        assert!(matches!(
+            state.services[&ServiceId("ntfy".into())].breaker,
+            crate::model::BreakerState::Closed
+        ));
+    }
+
+    #[test]
+    fn daily_summary_produces_alert() {
+        let config = test_config();
+        let graph = DepGraph::build(&config.services).unwrap();
+        let mut state = State::new(&config, 0);
+        let ctx = test_ctx(300);
+
+        let cmds = reduce(
+            &mut state,
+            Event::Tick {
+                due_tasks: vec![TaskKind::DailySummary],
+            },
+            &config,
+            &graph,
+            &ctx,
+        );
+
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, Command::SendAlert(a) if a.title.contains("сводка"))));
+    }
+
+    #[test]
+    fn lease_blocks_restart_during_backup() {
+        let config = test_config();
+        let graph = DepGraph::build(&config.services).unwrap();
+        let mut state = State::new(&config, 0);
+
+        // Simulate lease held on ntfy by backup.
+        state.leases.acquire(
+            ResourceId::Service(ServiceId("ntfy".into())),
+            "backup-100",
+            100,
+        );
+
+        let ctx = test_ctx(200);
+        let probes = vec![ProbeResult::Unhealthy {
+            service: ServiceId("ntfy".into()),
+            error: ProbeError::ConnectionRefused,
+            latency_ms: 5,
+        }];
+
+        let cmds = reduce(
+            &mut state,
+            Event::ProbeResults(probes),
+            &config,
+            &graph,
+            &ctx,
+        );
+
+        // Should NOT restart ntfy because lease is held.
+        assert!(!cmds
+            .iter()
+            .any(|c| matches!(c, Command::RestartService { id, .. } if id.as_str() == "ntfy")));
     }
 }

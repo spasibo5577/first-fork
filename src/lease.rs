@@ -91,6 +91,12 @@ impl LeaseArbiter {
         false
     }
 
+    /// Unconditionally releases a lease regardless of holder.
+    /// Used by the effect executor when the reducer emits `ReleaseLease`.
+    pub fn force_release(&mut self, resource: &ResourceId) {
+        self.held.remove(resource);
+    }
+
     #[must_use]
     pub fn holder(&self, resource: &ResourceId) -> Option<&str> {
         self.held.get(resource).map(|e| e.holder.as_str())
