@@ -16,7 +16,8 @@ use crate::notify::NotifySender;
 use crate::reduce::{self, Ctx};
 use crate::schedule::{self, Schedule, WallClock};
 use crate::state::State;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 /// Runs the main control loop. Blocks until shutdown.
@@ -29,6 +30,7 @@ pub fn run_control_loop(
     snapshot: SharedSnapshot,
     notifier: NotifySender,
     sd_notify: &crate::effect::systemd::SdNotify,
+    outbox_overflow: Arc<AtomicBool>,
 ) {
     let mono_start = monotonic_secs();
     let mut state = State::new(config, mono_start);
@@ -101,6 +103,9 @@ pub fn run_control_loop(
             );
         }
 
+        // Publish snapshot every loop iteration so heartbeat stays fresh.
+        publish_snapshot(&state, &snapshot, &outbox_overflow);
+
         match event_rx.recv_timeout(Duration::from_secs(1)) {
             Ok(event) => {
                 let ctx = make_ctx();
@@ -125,7 +130,7 @@ pub fn run_control_loop(
 
     eprintln!("[cratond] control loop exiting");
     sd_notify.status("shutting down");
-    publish_snapshot(&state, &snapshot);
+    publish_snapshot(&state, &snapshot, &outbox_overflow);
 }
 
 // ─── Command execution ────────────────────────────────────────
@@ -180,7 +185,7 @@ fn execute_commands(
                 exec_persist_backup(phase);
             }
             Command::PublishSnapshot => {
-                publish_snapshot(state, snapshot);
+                // Full publish happens every loop iteration; this is a no-op placeholder.
             }
             Command::NotifyWatchdog => {
                 sd_notify.watchdog();
@@ -436,7 +441,7 @@ fn exec_restic_unlock(config: &CratonConfig) {
 }
 
 fn exec_update_llm_context(state: &State, config: &CratonConfig) {
-    let snap = build_snapshot_json(state);
+    let snap = build_snapshot_json(state, &Arc::new(AtomicBool::new(false)));
     if let Err(e) = crate::persist::atomic_write(
         std::path::Path::new(&config.ai.context_path),
         snap.as_bytes(),
@@ -463,14 +468,14 @@ fn run_probes(service_ids: &[ServiceId], config: &CratonConfig) -> Vec<ProbeResu
 
 // ─── Snapshot ──────────────────────────────────────────────────
 
-fn publish_snapshot(state: &State, snapshot: &SharedSnapshot) {
-    let json = build_snapshot_json(state);
+fn publish_snapshot(state: &State, snapshot: &SharedSnapshot, outbox_overflow: &Arc<AtomicBool>) {
+    let json = build_snapshot_json(state, outbox_overflow);
     if let Ok(mut s) = snapshot.lock() {
         *s = json;
     }
 }
 
-fn build_snapshot_json(state: &State) -> String {
+fn build_snapshot_json(state: &State, outbox_overflow: &Arc<AtomicBool>) -> String {
     let mut services = serde_json::Map::new();
     for (id, svc) in &state.services {
         let status_json = serde_json::to_value(&svc.status).unwrap_or_default();
@@ -487,6 +492,7 @@ fn build_snapshot_json(state: &State) -> String {
         "snapshot_epoch_secs": epoch_secs_now(),
         "last_recovery_mono": state.last_recovery_mono,
         "start_mono": state.start_mono,
+        "outbox_overflow": outbox_overflow.load(Ordering::Relaxed),
     })
     .to_string()
 }

@@ -1,15 +1,31 @@
-//! NTFY notification delivery with retry, deduplication, and syslog fallback.
+//! NTFY notification delivery with retry, deduplication, and durable outbox.
 //!
 //! Architecture: single consumer thread reads from a bounded channel.
 //! Producers call `queue()` (non-blocking) from any thread.
-//! Failed deliveries are logged to stderr (captured by `journald`).
+//!
+//! # Durable outbox
+//!
+//! All alerts are written to `/var/lib/craton/alert-outbox.jsonl` before
+//! delivery. On startup, undelivered entries from previous runs are replayed.
+//! On overflow (>256 entries) oldest delivered entries are evicted first,
+//! then oldest undelivered (with explicit loss logging).
+//!
+//! The overflow flag (`Arc<AtomicBool>`) is shared with the control loop so
+//! it can be published in the snapshot and checked by `GET /health`.
 
 use crate::model::Alert;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::Write;
-use std::sync::mpsc;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
+
+const OUTBOX_MAX: usize = 256;
+
+// ─── Config / public API ──────────────────────────────────────
 
 /// Configuration for the notifier.
 #[derive(Debug, Clone)]
@@ -18,9 +34,14 @@ pub struct NotifyConfig {
     pub retries: Vec<Duration>,
     pub dedup_ttl: Duration,
     pub queue_size: usize,
+    /// Path to the durable alert outbox (JSONL file).
+    pub outbox_path: String,
+    /// Set to `true` when an undelivered alert is evicted due to overflow.
+    /// Shared with the control loop for snapshot publication.
+    pub overflow_flag: Arc<AtomicBool>,
 }
 
-/// Handle for queueing notifications. Clone-able, thread-safe (via `mpsc::Sender`).
+/// Handle for queueing notifications. Clone-able, thread-safe.
 #[derive(Clone)]
 pub struct NotifySender {
     tx: mpsc::SyncSender<Alert>,
@@ -28,13 +49,13 @@ pub struct NotifySender {
 
 impl NotifySender {
     /// Queues an alert for delivery. Non-blocking.
-    /// If the queue is full, the alert is dropped and logged to stderr.
+    /// If the queue is full the alert is dropped and logged to stderr.
     pub fn queue(&self, alert: Alert) {
         if let Err(mpsc::TrySendError::Full(dropped) | mpsc::TrySendError::Disconnected(dropped)) =
             self.tx.try_send(alert)
         {
             eprintln!(
-                "[cratond] ALERT DROPPED: {} | {}",
+                "[cratond] ALERT DROPPED (queue full): {} | {}",
                 dropped.title, dropped.body
             );
         }
@@ -50,6 +71,8 @@ pub fn create(config: NotifyConfig) -> (NotifySender, NotifyConsumer) {
     (NotifySender { tx }, NotifyConsumer { rx, config })
 }
 
+// ─── Consumer ─────────────────────────────────────────────────
+
 /// Consumer side of the notifier. Runs in its own thread.
 pub struct NotifyConsumer {
     rx: mpsc::Receiver<Alert>,
@@ -59,20 +82,70 @@ pub struct NotifyConsumer {
 impl NotifyConsumer {
     /// Runs the consumer loop. Blocks until the channel is closed.
     pub fn run(self) {
+        let outbox_path = PathBuf::from(&self.config.outbox_path);
+        let mut outbox = Outbox::load(&outbox_path);
         let mut dedup = DedupCache::new(self.config.dedup_ttl);
         let mut sent_count: u64 = 0;
         let mut failed_count: u64 = 0;
         let mut dedup_count: u64 = 0;
 
         eprintln!(
-            "[cratond] notifier started, url={}",
-            self.config.ntfy_url
+            "[cratond] notifier started, url={}, outbox={}",
+            self.config.ntfy_url, self.config.outbox_path
         );
 
+        // ── Startup replay ────────────────────────────────────
+        let undelivered: Vec<OutboxEntry> = outbox
+            .entries
+            .iter()
+            .filter(|e| !e.delivered)
+            .cloned()
+            .collect();
+
+        if !undelivered.is_empty() {
+            eprintln!(
+                "[cratond] replaying {} undelivered alert(s) from outbox",
+                undelivered.len()
+            );
+        }
+
+        for entry in &undelivered {
+            if dedup.is_duplicate(&entry.id) {
+                dedup_count += 1;
+                continue;
+            }
+            let mut delivered = false;
+            for delay in &self.config.retries {
+                if !delay.is_zero() {
+                    std::thread::sleep(*delay);
+                }
+                if send_ntfy(&self.config.ntfy_url, &entry.alert).is_ok() {
+                    delivered = true;
+                    dedup.record(entry.id.clone());
+                    break;
+                }
+            }
+            if delivered {
+                outbox.mark_delivered(&entry.id);
+                sent_count += 1;
+            } else {
+                failed_count += 1;
+                eprintln!(
+                    "[cratond] replay: NTFY unreachable for '{}', will retry next start",
+                    entry.alert.title
+                );
+            }
+        }
+        if !undelivered.is_empty() {
+            outbox.persist(&outbox_path);
+        }
+
+        // ── Main delivery loop ────────────────────────────────
         loop {
             let Ok(alert) = self.rx.recv() else {
                 eprintln!(
-                    "[cratond] notifier stopped: sent={sent_count} failed={failed_count} dedup={dedup_count}"
+                    "[cratond] notifier stopped: sent={sent_count} \
+                     failed={failed_count} dedup={dedup_count}"
                 );
                 return;
             };
@@ -83,12 +156,25 @@ impl NotifyConsumer {
                 continue;
             }
 
+            // Persist before delivery (crash-safe outbox).
+            outbox.append(OutboxEntry {
+                id: key.clone(),
+                alert: alert.clone(),
+                created_at: epoch_secs_now(),
+                delivered: false,
+            });
+
+            if outbox.compact_if_needed(OUTBOX_MAX) {
+                self.config.overflow_flag.store(true, Ordering::Relaxed);
+            }
+            outbox.persist(&outbox_path);
+
+            // Attempt delivery with retries.
             let mut delivered = false;
             for (attempt, delay) in self.config.retries.iter().enumerate() {
-                if delay.as_secs() > 0 || delay.as_millis() > 0 {
+                if !delay.is_zero() {
                     std::thread::sleep(*delay);
                 }
-
                 match send_ntfy(&self.config.ntfy_url, &alert) {
                     Ok(()) => {
                         delivered = true;
@@ -105,7 +191,10 @@ impl NotifyConsumer {
                 }
             }
 
-            if !delivered {
+            if delivered {
+                outbox.mark_delivered(&key);
+                outbox.persist(&outbox_path);
+            } else {
                 failed_count += 1;
                 eprintln!(
                     "[cratond] NTFY UNREACHABLE — alert: [{}] {} | {}",
@@ -118,16 +207,137 @@ impl NotifyConsumer {
     }
 }
 
+// ─── Outbox ───────────────────────────────────────────────────
+
+/// In-memory outbox backed by a persistent JSONL file.
+struct Outbox {
+    entries: Vec<OutboxEntry>,
+}
+
+impl Outbox {
+    /// Loads outbox from disk; returns empty outbox on any error.
+    fn load(path: &Path) -> Self {
+        let data = match crate::persist::read_optional(path) {
+            Ok(Some(d)) => d,
+            Ok(None) => {
+                return Self {
+                    entries: Vec::new(),
+                }
+            }
+            Err(e) => {
+                eprintln!("[cratond] failed to read outbox {}: {e}", path.display());
+                return Self {
+                    entries: Vec::new(),
+                };
+            }
+        };
+
+        let entries = String::from_utf8_lossy(&data)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|line| match serde_json::from_str::<OutboxEntry>(line) {
+                Ok(e) => Some(e),
+                Err(e) => {
+                    eprintln!("[cratond] outbox: skipping corrupt entry: {e}");
+                    None
+                }
+            })
+            .collect();
+
+        Self { entries }
+    }
+
+    fn append(&mut self, entry: OutboxEntry) {
+        self.entries.push(entry);
+    }
+
+    fn mark_delivered(&mut self, id: &str) {
+        if let Some(e) = self.entries.iter_mut().find(|e| e.id == id) {
+            e.delivered = true;
+        }
+    }
+
+    /// Evicts entries until `entries.len() <= max`.
+    /// Strategy: oldest delivered first, then oldest undelivered.
+    /// Returns `true` if any undelivered entries were evicted (overflow).
+    fn compact_if_needed(&mut self, max: usize) -> bool {
+        if self.entries.len() <= max {
+            return false;
+        }
+
+        // Sort ascending by creation time so we always remove the oldest.
+        self.entries.sort_by_key(|e| e.created_at);
+
+        let mut undelivered_lost = false;
+        while self.entries.len() > max {
+            if let Some(pos) = self.entries.iter().position(|e| e.delivered) {
+                self.entries.remove(pos);
+            } else {
+                // No delivered entries left — must drop an undelivered one.
+                let lost = self.entries.remove(0);
+                eprintln!(
+                    "[cratond] OUTBOX OVERFLOW: evicting undelivered alert '{}' (created_at={})",
+                    lost.alert.title, lost.created_at
+                );
+                undelivered_lost = true;
+            }
+        }
+
+        undelivered_lost
+    }
+
+    /// Atomically persists the full outbox to disk.
+    fn persist(&self, path: &Path) {
+        let mut buf = String::with_capacity(self.entries.len() * 128);
+        for entry in &self.entries {
+            match serde_json::to_string(entry) {
+                Ok(line) => {
+                    buf.push_str(&line);
+                    buf.push('\n');
+                }
+                Err(e) => eprintln!("[cratond] outbox: failed to serialize entry: {e}"),
+            }
+        }
+        if let Err(e) = crate::persist::atomic_write(path, buf.as_bytes()) {
+            eprintln!("[cratond] failed to persist outbox: {e}");
+        }
+    }
+
+    /// Total number of entries (delivered + undelivered).
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Number of undelivered entries.
+    #[cfg(test)]
+    fn undelivered_count(&self) -> usize {
+        self.entries.iter().filter(|e| !e.delivered).count()
+    }
+}
+
+// ─── OutboxEntry ──────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OutboxEntry {
+    id: String,
+    alert: Alert,
+    created_at: u64,
+    delivered: bool,
+}
+
+// ─── NTFY delivery ────────────────────────────────────────────
+
 fn send_ntfy(url: &str, alert: &Alert) -> Result<(), String> {
     let parsed = parse_ntfy_url(url).ok_or_else(|| format!("invalid NTFY URL: {url}"))?;
 
     let addr = format!("{}:{}", parsed.host, parsed.port);
-    let sock_addr: std::net::SocketAddr =
-        addr.parse().map_err(|e| format!("invalid address {addr}: {e}"))?;
+    let sock_addr: std::net::SocketAddr = addr
+        .parse()
+        .map_err(|e| format!("invalid address {addr}: {e}"))?;
 
-    let mut stream =
-        std::net::TcpStream::connect_timeout(&sock_addr, Duration::from_secs(5))
-            .map_err(|e| format!("connect: {e}"))?;
+    let mut stream = std::net::TcpStream::connect_timeout(&sock_addr, Duration::from_secs(5))
+        .map_err(|e| format!("connect: {e}"))?;
 
     stream
         .set_write_timeout(Some(Duration::from_secs(5)))
@@ -138,7 +348,8 @@ fn send_ntfy(url: &str, alert: &Alert) -> Result<(), String> {
 
     let body = &alert.body;
     let request = format!(
-        "POST {} HTTP/1.1\r\nHost: {}\r\nTitle: {}\r\nPriority: {}\r\nTags: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "POST {} HTTP/1.1\r\nHost: {}\r\nTitle: {}\r\nPriority: {}\r\nTags: {}\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{}",
         parsed.path,
         parsed.host,
         alert.title,
@@ -193,6 +404,8 @@ fn parse_ntfy_url(url: &str) -> Option<NtfyUrl> {
     })
 }
 
+// ─── Dedup cache ──────────────────────────────────────────────
+
 fn dedup_key(alert: &Alert) -> String {
     let mut hasher = Sha256::new();
     hasher.update(alert.title.as_bytes());
@@ -231,11 +444,42 @@ impl DedupCache {
     }
 }
 
+// ─── Helpers ──────────────────────────────────────────────────
+
+fn epoch_secs_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+// ─── Tests ────────────────────────────────────────────────────
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::model::AlertPriority;
+
+    fn make_alert(title: &str) -> Alert {
+        Alert {
+            title: title.to_string(),
+            body: "body".to_string(),
+            priority: AlertPriority::Default,
+            tags: String::new(),
+        }
+    }
+
+    fn make_entry(title: &str, created_at: u64, delivered: bool) -> OutboxEntry {
+        let alert = make_alert(title);
+        let id = dedup_key(&alert);
+        OutboxEntry {
+            id,
+            alert,
+            created_at,
+            delivered,
+        }
+    }
 
     #[test]
     fn dedup_blocks_duplicates() {
@@ -256,30 +500,15 @@ mod tests {
 
     #[test]
     fn dedup_key_deterministic() {
-        let a1 = Alert {
-            title: "test".into(),
-            body: "body".into(),
-            priority: AlertPriority::Default,
-            tags: String::new(),
-        };
+        let a1 = make_alert("test");
         let a2 = a1.clone();
         assert_eq!(dedup_key(&a1), dedup_key(&a2));
     }
 
     #[test]
     fn dedup_key_differs_for_different_alerts() {
-        let a1 = Alert {
-            title: "test1".into(),
-            body: "body".into(),
-            priority: AlertPriority::Default,
-            tags: String::new(),
-        };
-        let a2 = Alert {
-            title: "test2".into(),
-            body: "body".into(),
-            priority: AlertPriority::Default,
-            tags: String::new(),
-        };
+        let a1 = make_alert("test1");
+        let a2 = make_alert("test2");
         assert_ne!(dedup_key(&a1), dedup_key(&a2));
     }
 
@@ -290,14 +519,102 @@ mod tests {
             retries: vec![Duration::ZERO],
             dedup_ttl: Duration::from_secs(60),
             queue_size: 8,
+            outbox_path: "/tmp/test-outbox.jsonl".into(),
+            overflow_flag: Arc::new(AtomicBool::new(false)),
         };
         let (sender, _consumer) = create(config);
+        sender.queue(make_alert("hello"));
+    }
 
-        sender.queue(Alert {
-            title: "hello".into(),
-            body: "world".into(),
-            priority: AlertPriority::Default,
-            tags: String::new(),
-        });
+    #[test]
+    fn outbox_compact_removes_delivered_first() {
+        let mut outbox = Outbox {
+            entries: Vec::new(),
+        };
+
+        // 3 delivered (older) + 1 undelivered
+        for i in 0..3u64 {
+            outbox.append(make_entry(&format!("delivered-{i}"), i, true));
+        }
+        outbox.append(make_entry("undelivered", 10, false));
+
+        // max=3 → should remove 1 delivered (oldest)
+        let overflow = outbox.compact_if_needed(3);
+        assert!(!overflow, "no undelivered should be lost");
+        assert_eq!(outbox.len(), 3);
+        assert_eq!(outbox.undelivered_count(), 1, "undelivered must survive");
+    }
+
+    #[test]
+    fn outbox_compact_drops_undelivered_when_no_delivered() {
+        let mut outbox = Outbox {
+            entries: Vec::new(),
+        };
+        for i in 0..5u64 {
+            outbox.append(make_entry(&format!("pending-{i}"), i, false));
+        }
+
+        let overflow = outbox.compact_if_needed(3);
+        assert!(overflow, "must signal overflow");
+        assert_eq!(outbox.len(), 3);
+    }
+
+    #[test]
+    fn outbox_mark_delivered() {
+        let mut outbox = Outbox {
+            entries: Vec::new(),
+        };
+        let entry = make_entry("test", 1, false);
+        let id = entry.id.clone();
+        outbox.append(entry);
+
+        assert_eq!(outbox.undelivered_count(), 1);
+        outbox.mark_delivered(&id);
+        assert_eq!(outbox.undelivered_count(), 0);
+    }
+
+    #[test]
+    fn outbox_persist_and_load() {
+        let dir = std::env::temp_dir().join("craton_test_outbox");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let path = dir.join("alert-outbox.jsonl");
+
+        let mut outbox = Outbox {
+            entries: Vec::new(),
+        };
+        outbox.append(make_entry("alpha", 100, false));
+        outbox.append(make_entry("beta", 200, true));
+        outbox.persist(&path);
+
+        let loaded = Outbox::load(&path);
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded.undelivered_count(), 1);
+        assert_eq!(loaded.entries[0].alert.title, "alpha");
+        assert_eq!(loaded.entries[1].alert.title, "beta");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn outbox_load_nonexistent_returns_empty() {
+        let outbox = Outbox::load(std::path::Path::new("/nonexistent/path/outbox.jsonl"));
+        assert_eq!(outbox.len(), 0);
+    }
+
+    #[test]
+    fn overflow_flag_set_on_undelivered_eviction() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut outbox = Outbox {
+            entries: Vec::new(),
+        };
+        for i in 0..10u64 {
+            outbox.append(make_entry(&format!("p{i}"), i, false));
+        }
+        let overflowed = outbox.compact_if_needed(5);
+        if overflowed {
+            flag.store(true, Ordering::Relaxed);
+        }
+        assert!(flag.load(Ordering::Relaxed));
     }
 }

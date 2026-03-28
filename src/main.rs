@@ -28,7 +28,8 @@ mod state;
 
 use model::{Event, SignalKind};
 use sha2::{Digest, Sha256};
-use std::sync::mpsc;
+use std::sync::atomic::AtomicBool;
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 /// Loads an existing remediation token or generates a new one on first run.
@@ -143,6 +144,7 @@ fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Notifier.
+    let outbox_overflow = Arc::new(AtomicBool::new(false));
     let notify_config = notify::NotifyConfig {
         ntfy_url: format!("{}/{}", cfg.ntfy.url, cfg.ntfy.topic),
         retries: cfg
@@ -153,6 +155,8 @@ fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
             .collect(),
         dedup_ttl: Duration::from_secs(1800), // 30 min
         queue_size: 64,
+        outbox_path: "/var/lib/craton/alert-outbox.jsonl".into(),
+        overflow_flag: outbox_overflow.clone(),
     };
     let (notif_sender, notif_consumer) = notify::create(notify_config);
 
@@ -182,6 +186,7 @@ fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
         snapshot,
         notif_sender,
         &sd,
+        outbox_overflow,
     );
 
     Ok(())

@@ -102,6 +102,20 @@ fn handle_health(snapshot: &SharedSnapshot) -> tiny_http::Response<std::io::Curs
         }
     }
 
+    // Check outbox overflow.
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&snap) {
+        if parsed
+            .get("outbox_overflow")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            return json_response(
+                503,
+                r#"{"status":"unavailable","reason":"alert outbox overflow — undelivered alerts lost"}"#,
+            );
+        }
+    }
+
     let status = if snap.contains("\"unhealthy\"") || snap.contains("\"failed\"") {
         "degraded"
     } else {
