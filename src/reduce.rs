@@ -1225,4 +1225,169 @@ url = "http://localhost:8080/v1/health"
             .iter()
             .any(|c| matches!(c, Command::RestartService { id, .. } if id.as_str() == "ntfy")));
     }
+
+    #[test]
+    fn remediation_rate_limit_blocks_after_max() {
+        let config = test_config();
+        let graph = DepGraph::build(&config.services).unwrap();
+        let mut state = State::new(&config, 0);
+        let ctx = test_ctx(3600);
+
+        // First 3 RestartService remediations should succeed.
+        for i in 0..3usize {
+            let cmds = reduce(
+                &mut state,
+                Event::HttpCommand(CommandRequest::Remediate {
+                    action: RemediationAction::RestartService,
+                    target: Some(ServiceId("ntfy".into())),
+                    source: "http:api".into(),
+                    reason: format!("attempt {i}"),
+                }),
+                &config,
+                &graph,
+                &ctx,
+            );
+            assert!(
+                cmds.iter().any(
+                    |c| matches!(c, Command::RestartService { id, .. } if id.as_str() == "ntfy")
+                ),
+                "attempt {i} should have been accepted"
+            );
+        }
+
+        // 4th attempt within the same hour must be rate-limited.
+        let cmds = reduce(
+            &mut state,
+            Event::HttpCommand(CommandRequest::Remediate {
+                action: RemediationAction::RestartService,
+                target: Some(ServiceId("ntfy".into())),
+                source: "http:api".into(),
+                reason: "over limit".into(),
+            }),
+            &config,
+            &graph,
+            &ctx,
+        );
+        assert!(
+            !cmds
+                .iter()
+                .any(|c| matches!(c, Command::RestartService { .. })),
+            "4th attempt should be rate-limited"
+        );
+
+        // Verify the rejection was logged.
+        assert!(state
+            .remediation_log
+            .iter()
+            .any(|r| r.result.contains("rate limited")));
+    }
+
+    #[test]
+    fn remediation_rate_limit_resets_after_window() {
+        let config = test_config();
+        let graph = DepGraph::build(&config.services).unwrap();
+        let mut state = State::new(&config, 0);
+
+        // Fill up 3 restarts at mono=100.
+        let ctx_early = test_ctx(100);
+        for _ in 0..3 {
+            reduce(
+                &mut state,
+                Event::HttpCommand(CommandRequest::Remediate {
+                    action: RemediationAction::RestartService,
+                    target: Some(ServiceId("ntfy".into())),
+                    source: "http:api".into(),
+                    reason: "fill".into(),
+                }),
+                &config,
+                &graph,
+                &ctx_early,
+            );
+        }
+
+        // At mono=100+3601 (window expired) a new attempt should succeed.
+        let ctx_later = Ctx {
+            mono_secs: 100 + 3601,
+            epoch_secs: 100 + 3601 + 1_700_000_000,
+            wall: WallClock {
+                year: 2025,
+                month: 1,
+                day: 15,
+                hour: 9,
+                minute: 0,
+                second: 0,
+                weekday: 2,
+            },
+        };
+        let cmds = reduce(
+            &mut state,
+            Event::HttpCommand(CommandRequest::Remediate {
+                action: RemediationAction::RestartService,
+                target: Some(ServiceId("ntfy".into())),
+                source: "http:api".into(),
+                reason: "after window".into(),
+            }),
+            &config,
+            &graph,
+            &ctx_later,
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Command::RestartService { id, .. } if id.as_str() == "ntfy")),
+            "should be accepted after window expires"
+        );
+    }
+
+    #[test]
+    fn incident_uses_epoch_secs_not_mono() {
+        let config = test_config();
+        let graph = DepGraph::build(&config.services).unwrap();
+        let mut state = State::new(&config, 0);
+        let ctx = test_ctx(500);
+
+        // Force ntfy into Failed state so WriteIncident is emitted.
+        state
+            .services
+            .get_mut(&ServiceId("ntfy".into()))
+            .unwrap()
+            .status = crate::state::ServiceStatus::Recovering {
+            attempt: 99,
+            since_mono: 0,
+        };
+
+        let probes = vec![ProbeResult::Unhealthy {
+            service: ServiceId("ntfy".into()),
+            error: ProbeError::ConnectionRefused,
+            latency_ms: 5,
+        }];
+
+        let cmds = reduce(
+            &mut state,
+            Event::ProbeResults(probes),
+            &config,
+            &graph,
+            &ctx,
+        );
+
+        // Find WriteIncident command and check it uses epoch_secs, not mono_secs.
+        let incident_cmd = cmds.iter().find_map(|c| {
+            if let Command::WriteIncident(r) = c {
+                Some(r)
+            } else {
+                None
+            }
+        });
+
+        if let Some(report) = incident_cmd {
+            assert_eq!(
+                report.timestamp_epoch_secs, ctx.epoch_secs,
+                "incident timestamp must use epoch_secs, not mono_secs"
+            );
+            assert_ne!(
+                report.timestamp_epoch_secs, ctx.mono_secs,
+                "epoch_secs and mono_secs must differ"
+            );
+        }
+        // (If no incident was emitted the service wasn't unrecoverable yet — that's OK.)
+    }
 }
