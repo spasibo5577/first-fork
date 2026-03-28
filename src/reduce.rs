@@ -19,6 +19,8 @@ use std::collections::BTreeMap;
 /// Context provided by the runtime to the reducer on each call.
 pub struct Ctx {
     pub mono_secs: u64,
+    /// Unix epoch seconds (wall clock). Use for timestamps in incidents/records.
+    pub epoch_secs: u64,
     pub wall: WallClock,
 }
 
@@ -217,7 +219,7 @@ fn apply_decisions(
                     cmds.push(Command::WriteIncident(IncidentReport {
                         kind: IncidentKind::ServiceUnrecoverable,
                         service: Some(sid.clone()),
-                        timestamp_epoch_secs: ctx.mono_secs,
+                        timestamp_epoch_secs: ctx.epoch_secs,
                         details: BTreeMap::from([("error".into(), error.clone())]),
                     }));
                 }
@@ -462,7 +464,7 @@ fn handle_backup_failure(
         cmds.push(Command::WriteIncident(IncidentReport {
             kind: IncidentKind::BackupFailed,
             service: None,
-            timestamp_epoch_secs: ctx.mono_secs,
+            timestamp_epoch_secs: ctx.epoch_secs,
             details: BTreeMap::from([(
                 "consecutive_failures".into(),
                 state.consecutive_backup_failures.to_string(),
@@ -557,6 +559,36 @@ fn handle_http_command(
     }
 }
 
+fn remediation_rate_limited(
+    state: &State,
+    action: &RemediationAction,
+    target: Option<&ServiceId>,
+    now_mono: u64,
+) -> bool {
+    let (window_secs, max_count) = match action {
+        RemediationAction::RestartService => (3600u64, 3usize),
+        RemediationAction::DockerRestart => (3600, 1),
+        RemediationAction::TriggerBackup => (86400, 1),
+        RemediationAction::MarkMaintenance => (3600, 5),
+        _ => return false,
+    };
+
+    let action_str = format!("{action:?}");
+    let cutoff = now_mono.saturating_sub(window_secs);
+
+    let count = state
+        .remediation_log
+        .iter()
+        .filter(|r| {
+            r.mono >= cutoff
+                && r.action == action_str
+                && r.target.as_ref().map(ServiceId::as_str) == target.map(ServiceId::as_str)
+        })
+        .count();
+
+    count >= max_count
+}
+
 fn handle_remediation(
     state: &mut State,
     action: &RemediationAction,
@@ -567,6 +599,11 @@ fn handle_remediation(
     ctx: &Ctx,
 ) -> Vec<Command> {
     let mut cmds = Vec::new();
+
+    if remediation_rate_limited(state, action, target, ctx.mono_secs) {
+        record_remediation(state, action, target, source, "rejected: rate limited", ctx);
+        return vec![];
+    }
 
     let result_str = match action {
         RemediationAction::RestartService => {
@@ -877,14 +914,15 @@ url = "http://localhost:8080/v1/health"
         CratonConfig::from_toml(toml).unwrap()
     }
 
-    fn test_ctx(mono: u64) -> Ctx {
+    fn test_ctx(mono_secs: u64) -> Ctx {
         Ctx {
-            mono_secs: mono,
+            mono_secs,
+            epoch_secs: mono_secs + 1_700_000_000,
             wall: WallClock {
                 year: 2025,
                 month: 1,
                 day: 15,
-                hour: 4,
+                hour: 9,
                 minute: 0,
                 second: 0,
                 weekday: 2,

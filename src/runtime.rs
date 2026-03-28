@@ -481,6 +481,9 @@ fn build_snapshot_json(state: &State) -> String {
         "shutting_down": state.shutting_down,
         "backup_history": state.backup_history.to_vec(),
         "recovery_history": state.recovery_history.to_vec(),
+        "snapshot_epoch_secs": epoch_secs_now(),
+        "last_recovery_mono": state.last_recovery_mono,
+        "start_mono": state.start_mono,
     })
     .to_string()
 }
@@ -605,8 +608,16 @@ fn check_daily_schedules(due: &mut Vec<TaskKind>, state: &mut State, wall: &Wall
 fn make_ctx() -> Ctx {
     Ctx {
         mono_secs: monotonic_secs(),
+        epoch_secs: epoch_secs_now(),
         wall: WallClock::now(),
     }
+}
+
+fn epoch_secs_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn monotonic_secs() -> u64 {

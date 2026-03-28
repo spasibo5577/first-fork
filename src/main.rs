@@ -1,6 +1,13 @@
 //! Craton Infrastructure Daemon — autonomous server management.
 //!
 //! Single binary, single control loop, no external runtime dependencies.
+//!
+//! Startup phases:
+//!   1. Load config
+//!   2. Build dependency graph
+//!   3. Create runtime directories
+//!   4. Initialize subsystems (signal, notifier, HTTP, token)
+//!   5. Run control loop (blocks until shutdown)
 
 mod breaker;
 mod config;
@@ -20,8 +27,48 @@ mod signal;
 mod state;
 
 use model::{Event, SignalKind};
+use sha2::{Digest, Sha256};
 use std::sync::mpsc;
 use std::time::Duration;
+
+/// Loads an existing remediation token or generates a new one on first run.
+///
+/// Token is a hex-encoded SHA-256 digest seeded from PID + time.
+/// Written atomically to `token_path` so it survives daemon restarts.
+fn load_or_create_token(token_path: &str) -> String {
+    let path = std::path::Path::new(token_path);
+
+    // Try to read existing token.
+    if let Ok(Some(data)) = persist::read_optional(path) {
+        if let Ok(s) = String::from_utf8(data) {
+            let s = s.trim().to_string();
+            if !s.is_empty() {
+                return s;
+            }
+        }
+    }
+
+    // Generate new token: SHA-256(pid || now_nanos || salt).
+    let pid = std::process::id();
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+
+    let mut hasher = Sha256::new();
+    hasher.update(pid.to_le_bytes());
+    hasher.update(now_ns.to_le_bytes());
+    hasher.update(b"cratond-remediation-token-v1");
+    let token = format!("{:x}", hasher.finalize());
+
+    if let Err(e) = persist::atomic_write(path, token.as_bytes()) {
+        eprintln!("[cratond] warning: failed to write token to {token_path}: {e}");
+    } else {
+        eprintln!("[cratond] remediation token written to {token_path}");
+    }
+
+    token
+}
 
 fn main() {
     let config_path = std::env::args()
@@ -118,7 +165,13 @@ fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     // HTTP API.
     let snapshot = http::empty_snapshot();
-    http::spawn_http_thread(&cfg.daemon.listen, snapshot.clone(), event_tx.clone())?;
+    let remediation_token = load_or_create_token(&cfg.ai.token_path);
+    http::spawn_http_thread(
+        &cfg.daemon.listen,
+        snapshot.clone(),
+        event_tx.clone(),
+        remediation_token,
+    )?;
 
     // ── Phase 5: Run control loop (blocks until shutdown) ──
     runtime::run_control_loop(
