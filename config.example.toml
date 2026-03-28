@@ -1,0 +1,256 @@
+# ============================================================
+# Пример конфигурации cratond
+# Путь по умолчанию: /etc/craton/config.toml
+# Неизвестные поля вызывают ошибку при парсинге.
+# ============================================================
+
+
+# ── Параметры демона ─────────────────────────────────────────
+
+[daemon]
+# Адрес для HTTP API (только localhost — нет TLS, нет общей auth)
+listen = "127.0.0.1:18800"
+
+# Отправлять WATCHDOG=1 в systemd (требует WatchdogSec в unit-файле)
+watchdog = true
+
+# Уровень логирования (info / warn / error — влияет только на будущий structured log)
+log_level = "info"
+
+
+# ── Уведомления через NTFY ───────────────────────────────────
+
+[ntfy]
+# Базовый URL NTFY-сервера (без слэша на конце)
+url = "http://127.0.0.1:8080"
+
+# Топик для отправки алертов
+topic = "craton-alerts"
+
+# Задержки между попытками доставки в секундах
+# [0] = немедленная первая попытка, затем 5s, 15s, 60s
+retries = [0, 5, 15, 60]
+
+
+# ── Резервное копирование (restic) ───────────────────────────
+
+[backup]
+# Расписание: "odd_days:HH:MM" (нечётные дни) или "daily:HH:MM"
+schedule = "odd_days:04:00"
+
+# Путь к репозиторию restic (локальный или sftp/b2/s3)
+restic_repo = "/opt/restic-repo"
+
+# Файл с паролем репозитория (НЕ сам пароль)
+restic_password_file = "/root/.config/restic/passphrase"
+
+# Путь к бинарному файлу restic
+restic_binary = "/usr/bin/restic"
+
+# Директории для включения в backup
+# Если пусто — backup запустится без путей (только метаданные restic)
+paths = [
+    "/etc",
+    "/var/lib/craton",
+    "/root/.config",
+]
+
+# Запускать restic check после forget (проверка целостности)
+verify = true
+
+# Процент данных для случайной проверки при verify
+verify_subset_percent = 5
+
+[backup.retention]
+# Сколько ежедневных снимков хранить
+daily   = 7
+# Сколько еженедельных снимков хранить
+weekly  = 4
+# Сколько ежемесячных снимков хранить
+monthly = 6
+
+
+# ── Мониторинг диска ─────────────────────────────────────────
+
+[disk]
+# Интервал проверки (только для документации, фактически 6h hardcoded)
+interval = "6h"
+
+# Порог предупреждения (%)
+warn_percent = 85
+
+# Критический порог (%). Должен быть строго больше warn_percent.
+critical_percent = 95
+
+# Включить предиктивный анализ (OLS по последним 14 замерам)
+# Только информативно — автоматических действий не предпринимает
+predictive = false
+
+
+# ── Проверка обновлений ───────────────────────────────────────
+
+[updates]
+# Расписание проверки APT-обновлений
+apt_schedule = "daily:09:00"
+
+# Расписание проверки Docker-образов
+docker_schedule = "weekly:sun:10:00"
+
+
+# ── Интеграция с AI (PicoClaw) ────────────────────────────────
+
+[ai]
+# Режим: "disabled" | "audit" | "enabled"
+# audit  — логирует предложения AI, не выполняет
+# enabled — выполняет действия из whitelist (с rate limiting)
+mode = "disabled"
+
+# URL PicoClaw-сервера (нужен только если mode != "disabled")
+picoclaw_url = ""
+
+# Путь к файлу с JSON-контекстом для LLM (volatile, tmpfs)
+context_path = "/run/craton/llm_context.json"
+
+# Путь к файлу с bearer-токеном для /api/v1/remediate
+# Генерируется автоматически при первом запуске
+token_path = "/var/lib/craton/remediation-token"
+
+
+# ── Сервисы ───────────────────────────────────────────────────
+# Каждый [[service]] — один управляемый сервис.
+# Порядок не важен — зависимости разрешаются через depends_on.
+
+# --- Пример: DNS-резолвер (Unbound) ---
+
+[[service]]
+id   = "unbound"
+name = "Unbound DNS"
+unit = "unbound.service"
+# kind: "systemd" | "docker_systemd" | "virtual"
+kind = "systemd"
+
+# Важность сервиса определяет максимальное число попыток рестарта:
+# info=1, warning=3, critical=5
+severity = "critical"
+
+# Секунды ожидания после старта перед первым probe
+startup_grace_secs = 15
+
+# Минимальный интервал между рестартами (секунды)
+restart_cooldown_secs = 60
+
+# Максимальное число рестартов до срабатывания breaker
+max_restarts = 3
+
+# Окно в секундах для подсчёта рестартов (breaker window)
+breaker_window_secs = 3600
+
+# Время в секундах, на которое breaker блокирует рестарты после срабатывания
+breaker_cooldown_secs = 3600
+
+# Остановить перед backup и поднять после
+backup_stop = false
+
+[service.probe]
+# Тип пробы: "http" | "dns" | "systemd_active" | "exec"
+type    = "dns"
+server  = "127.0.0.1"
+port    = 5335
+query   = "google.com"
+timeout_secs = 5
+
+
+# --- Пример: AdGuard Home (зависит от Unbound) ---
+
+[[service]]
+id         = "adguard"
+name       = "AdGuard Home"
+unit       = "AdGuardHome.service"
+kind       = "systemd"
+severity   = "critical"
+depends_on = ["unbound"]
+
+backup_stop = false
+
+[service.probe]
+type    = "dns"
+server  = "127.0.0.1"
+port    = 53
+query   = "google.com"
+timeout_secs = 5
+
+
+# --- Пример: NTFY (HTTP probe) ---
+
+[[service]]
+id       = "ntfy"
+name     = "NTFY"
+unit     = "ntfy.service"
+kind     = "systemd"
+severity = "critical"
+
+[service.probe]
+type          = "http"
+url           = "http://127.0.0.1:8080/v1/health"
+timeout_secs  = 5
+expect_status = 200
+
+
+# --- Пример: Tailscale (exec probe с JSON-полем) ---
+
+[[service]]
+id       = "tailscale"
+name     = "Tailscale VPN"
+unit     = "tailscaled.service"
+kind     = "systemd"
+severity = "warning"
+
+[service.probe]
+type         = "exec"
+argv         = ["tailscale", "status", "--json"]
+timeout_secs = 10
+
+# Проверить конкретное поле JSON-вывода
+[service.probe.expect_stdout]
+kind     = "json_field"
+pointer  = "/BackendState"
+expected = "Running"
+
+
+# --- Пример: виртуальный узел Docker Daemon ---
+# Virtual-сервис не имеет unit/probe, но участвует в dependency graph.
+# Используется для корреляции: если несколько docker_systemd сервисов
+# падают одновременно — root cause = docker_daemon.
+
+[[service]]
+id       = "docker_daemon"
+name     = "Docker Daemon"
+unit     = "docker.service"
+kind     = "virtual"
+severity = "critical"
+
+[service.probe]
+type = "systemd_active"
+
+
+# --- Пример: Docker-контейнер (зависит от docker_daemon) ---
+
+[[service]]
+id         = "continuwuity"
+name       = "Continuwuity (Matrix)"
+unit       = "continuwuity.service"
+kind       = "docker_systemd"
+severity   = "warning"
+depends_on = ["docker_daemon"]
+
+# Остановить перед backup (данные должны быть consistent)
+backup_stop = true
+
+startup_grace_secs    = 30
+restart_cooldown_secs = 120
+
+[service.probe]
+type          = "http"
+url           = "http://127.0.0.1:8448/_matrix/client/versions"
+timeout_secs  = 10
+expect_status = 200

@@ -1,0 +1,60 @@
+[Unit]
+Description=Craton Infrastructure Daemon
+Documentation=https://github.com/craton/cratond
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/cratond /etc/craton/config.toml
+Restart=on-failure
+RestartSec=5s
+
+# Watchdog — cratond отправляет WATCHDOG=1 из control loop каждую итерацию.
+# Если loop завис — systemd рестартует процесс.
+WatchdogSec=30
+
+# Graceful shutdown: SIGTERM → 30 секунд на завершение
+TimeoutStopSec=30
+KillMode=mixed
+KillSignal=SIGTERM
+
+# Пользователь и группа (создать заранее: useradd -r -s /sbin/nologin craton)
+# User=craton
+# Group=craton
+
+# Рабочие директории
+RuntimeDirectory=craton
+RuntimeDirectoryMode=0750
+StateDirectory=craton
+StateDirectoryMode=0750
+LogsDirectory=craton
+LogsDirectoryMode=0750
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/craton /run/craton /root/.picoclaw
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# Переменные окружения для restic (опционально — можно задавать в config.toml)
+# Environment=RESTIC_REPOSITORY=/opt/restic-repo
+# Environment=RESTIC_PASSWORD_FILE=/root/.config/restic/passphrase
+
+# Логирование через journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cratond
+
+[Install]
+WantedBy=multi-user.target
