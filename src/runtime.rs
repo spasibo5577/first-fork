@@ -33,6 +33,9 @@ pub fn run_control_loop(
     let mono_start = monotonic_secs();
     let mut state = State::new(config, mono_start);
 
+    // Load persisted maintenance entries (drop expired ones).
+    load_persisted_maintenance(&mut state, mono_start);
+
     // Crash recovery from persisted backup state.
     let persisted_phase = load_persisted_backup_phase();
     if !persisted_phase.is_idle() {
@@ -489,6 +492,43 @@ fn build_snapshot_json(state: &State) -> String {
 }
 
 // ─── Persistence helpers ───────────────────────────────────────
+
+fn load_persisted_maintenance(state: &mut State, now_mono: u64) {
+    let path = std::path::Path::new("/var/lib/craton/maintenance.json");
+    let data = match crate::persist::read_optional(path) {
+        Ok(Some(d)) => d,
+        Ok(None) => return,
+        Err(e) => {
+            eprintln!("[cratond] failed to read maintenance.json: {e}");
+            return;
+        }
+    };
+
+    let entries: std::collections::BTreeMap<String, crate::state::Maintenance> =
+        match serde_json::from_slice(&data) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("[cratond] failed to parse maintenance.json: {e}");
+                return;
+            }
+        };
+
+    let mut loaded = 0usize;
+    let mut expired = 0usize;
+    for (id_str, maint) in entries {
+        // Drop entries that already expired.
+        if maint.until_mono <= now_mono {
+            expired += 1;
+            continue;
+        }
+        let sid = crate::model::ServiceId(id_str);
+        if let Some(svc) = state.services.get_mut(&sid) {
+            svc.maintenance = Some(maint);
+            loaded += 1;
+        }
+    }
+    eprintln!("[cratond] maintenance loaded: {loaded} active, {expired} expired");
+}
 
 fn load_persisted_backup_phase() -> BackupPhase {
     let path = std::path::Path::new("/var/lib/craton/backup-state.json");

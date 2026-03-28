@@ -6,7 +6,7 @@ use crate::config::CratonConfig;
 use crate::history::RingBuf;
 use crate::lease::LeaseArbiter;
 use crate::model::{BackupPhase, BreakerState, ServiceId};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 const MAX_RESTART_HISTORY: usize = 20;
@@ -166,7 +166,7 @@ impl ServiceStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Maintenance {
     pub until_mono: u64,
     pub reason: String,
