@@ -489,6 +489,7 @@ fn build_snapshot_json(state: &State, outbox_overflow: &Arc<AtomicBool>) -> Stri
         "shutting_down": state.shutting_down,
         "backup_history": state.backup_history.to_vec(),
         "recovery_history": state.recovery_history.to_vec(),
+        "remediation_history": state.remediation_log.to_vec(),
         "snapshot_epoch_secs": epoch_secs_now(),
         "last_recovery_mono": state.last_recovery_mono,
         "start_mono": state.start_mono,
