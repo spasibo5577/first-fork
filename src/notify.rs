@@ -637,4 +637,61 @@ mod tests {
         }
         assert!(flag.load(Ordering::Relaxed));
     }
+
+    #[test]
+    fn outbox_collapse_duplicate_ids_keeps_latest() {
+        // Regression test for issue: duplicate IDs with conflicting delivered flags.
+        // Create a JSONL file with duplicate IDs and different delivered states.
+        let dir = std::env::temp_dir().join("craton_test_collapse");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let path = dir.join("alert-outbox.jsonl");
+
+        // Create JSONL with duplicate IDs simulating the bug:
+        // Same ID appears twice with different created_at and delivered flags.
+        let entry1 = make_entry("startup", 100, true);
+        let entry2 = make_entry("startup", 200, false);
+        assert_eq!(entry1.id, entry2.id, "same title → same ID");
+
+        let entry3 = make_entry("alert", 300, false);
+        let entry4 = make_entry("alert", 400, true);
+        assert_eq!(entry3.id, entry4.id, "same title → same ID");
+
+        // Manually write JSONL with duplicates (simulating past bug behavior)
+        let jsonl_content = format!(
+            "{}\n{}\n{}\n{}",
+            serde_json::to_string(&entry1).unwrap(),
+            serde_json::to_string(&entry2).unwrap(),
+            serde_json::to_string(&entry3).unwrap(),
+            serde_json::to_string(&entry4).unwrap(),
+        );
+        std::fs::write(&path, &jsonl_content).expect("write JSONL");
+
+        // Load and verify collapse behavior
+        let loaded = Outbox::load(&path);
+
+        // Should have 2 entries (one per unique ID), not 4
+        assert_eq!(loaded.len(), 2, "should collapse to unique IDs");
+
+        // Verify latest record is kept for each ID
+        // entry2 (created_at=200, delivered=false) should be latest for entry1.id
+        // entry4 (created_at=400, delivered=true) should be latest for entry3.id
+        let startup_entry = loaded.entries.iter().find(|e| e.id == entry1.id).unwrap();
+        assert_eq!(startup_entry.created_at, 200, "should keep latest created_at");
+        assert!(!startup_entry.delivered, "startup should be undelivered (latest)");
+
+        let alert_entry = loaded.entries.iter().find(|e| e.id == entry3.id).unwrap();
+        assert_eq!(alert_entry.created_at, 400, "should keep latest created_at");
+        assert!(alert_entry.delivered, "alert should be delivered (latest)");
+
+        // Verify replay count is correct: only 1 undelivered entry (startup)
+        let undelivered_count = loaded
+            .entries
+            .iter()
+            .filter(|e| !e.delivered)
+            .count();
+        assert_eq!(undelivered_count, 1, "only startup should be undelivered for replay");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
