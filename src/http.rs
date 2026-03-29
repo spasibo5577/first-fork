@@ -143,13 +143,36 @@ fn handle_state(snapshot: &SharedSnapshot) -> tiny_http::Response<std::io::Curso
 
 fn handle_history(
     snapshot: &SharedSnapshot,
-    _path: &str,
+    path: &str,
 ) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
     let snap = match snapshot.lock() {
         Ok(s) => s.clone(),
         Err(_) => "{}".to_string(),
     };
-    json_response(200, &snap)
+
+    let target = path.strip_prefix("/api/v1/history/").unwrap_or("");
+    let parsed = serde_json::from_str::<serde_json::Value>(&snap).unwrap_or_else(|_| {
+        serde_json::json!({
+            "backup_history": [],
+            "recovery_history": [],
+            "remediation_history": []
+        })
+    });
+
+    let response_value = match target {
+        "recovery" => parsed.get("recovery_history").cloned().unwrap_or_else(|| {
+            serde_json::json!([])
+        }),
+        "backup" => parsed.get("backup_history").cloned().unwrap_or_else(|| {
+            serde_json::json!([])
+        }),
+        "remediation" => parsed.get("remediation_history").cloned().unwrap_or_else(|| {
+            serde_json::json!([])
+        }),
+        _ => return json_response(404, r#"{"error":"not found"}"#),
+    };
+
+    json_response(200, &response_value.to_string())
 }
 
 fn handle_diagnose(path: &str) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
@@ -334,3 +357,59 @@ fn json_response(status: u16, body: &str) -> tiny_http::Response<std::io::Cursor
         None,
     )
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    #[test]
+    fn history_recovery_returns_only_recovery_list() {
+        let snapshot: SharedSnapshot = Arc::new(Mutex::new(
+            r#"{"recovery_history":[{"mono":1,"recovered":[],"failed":[],"docker_restarted":false,"duration_ms":0}],"backup_history":[{"mono":2,"success":true,"partial":false,"error":null,"duration_secs":1}],"snapshot_epoch_secs":123}"#.to_string(),
+        ));
+
+        let resp = handle_history(&snapshot, "/api/v1/history/recovery");
+        assert_eq!(resp.status_code(), tiny_http::StatusCode(200));
+
+        let mut body = String::new();
+        resp.into_reader().read_to_string(&mut body).unwrap();
+        let data: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(data.is_array());
+        assert_eq!(data[0]["mono"], 1);
+    }
+
+    #[test]
+    fn history_backup_returns_only_backup_list() {
+        let snapshot: SharedSnapshot = Arc::new(Mutex::new(
+            r#"{"recovery_history":[{"mono":1,"recovered":[],"failed":[],"docker_restarted":false,"duration_ms":0}],"backup_history":[{"mono":2,"success":true,"partial":false,"error":null,"duration_secs":1}],"snapshot_epoch_secs":123}"#.to_string(),
+        ));
+
+        let resp = handle_history(&snapshot, "/api/v1/history/backup");
+        assert_eq!(resp.status_code(), tiny_http::StatusCode(200));
+
+        let mut body = String::new();
+        resp.into_reader().read_to_string(&mut body).unwrap();
+        let data: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(data.is_array());
+        assert_eq!(data[0]["mono"], 2);
+    }
+
+    #[test]
+    fn history_remediation_returns_empty_array() {
+        let snapshot: SharedSnapshot = Arc::new(Mutex::new(
+            r#"{"recovery_history":[{"mono":1,"recovered":[],"failed":[],"docker_restarted":false,"duration_ms":0}],"backup_history":[{"mono":2,"success":true,"partial":false,"error":null,"duration_secs":1}],"snapshot_epoch_secs":123}"#.to_string(),
+        ));
+
+        let resp = handle_history(&snapshot, "/api/v1/history/remediation");
+        assert_eq!(resp.status_code(), tiny_http::StatusCode(200));
+
+        let mut body = String::new();
+        resp.into_reader().read_to_string(&mut body).unwrap();
+        let data: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(data.is_array(), "remediation endpoint should return array");
+        assert!(data.as_array().unwrap().is_empty(), "should be empty when not in snapshot");
+    }
+}
+
