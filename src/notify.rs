@@ -81,6 +81,7 @@ pub struct NotifyConsumer {
 
 impl NotifyConsumer {
     /// Runs the consumer loop. Blocks until the channel is closed.
+    #[allow(clippy::too_many_lines)]
     pub fn run(self) {
         let outbox_path = PathBuf::from(&self.config.outbox_path);
         let mut outbox = Outbox::load(&outbox_path);
@@ -232,7 +233,8 @@ impl Outbox {
             }
         };
 
-        let entries = String::from_utf8_lossy(&data)
+        // Parse JSONL lines, skip corrupt ones
+        let mut parsed: Vec<OutboxEntry> = String::from_utf8_lossy(&data)
             .lines()
             .filter(|l| !l.trim().is_empty())
             .filter_map(|line| match serde_json::from_str::<OutboxEntry>(line) {
@@ -243,6 +245,24 @@ impl Outbox {
                 }
             })
             .collect();
+
+        // Collapse entries by id, keeping only the latest record (by created_at).
+        // This prevents duplicate IDs with conflicting delivered flags.
+        let mut latest: HashMap<String, OutboxEntry> = HashMap::new();
+        for e in parsed.drain(..) {
+            match latest.get(&e.id) {
+                Some(existing) if existing.created_at >= e.created_at => {
+                    // keep existing
+                }
+                _ => {
+                    latest.insert(e.id.clone(), e);
+                }
+            }
+        }
+
+        // Rebuild entries vector sorted by created_at ascending for deterministic behavior.
+        let mut entries: Vec<OutboxEntry> = latest.into_values().collect();
+        entries.sort_by_key(|e| e.created_at);
 
         Self { entries }
     }
