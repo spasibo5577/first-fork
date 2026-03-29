@@ -448,9 +448,6 @@ pub enum Command {
     },
 
     // ── Backup ──
-    RunBackupPhase {
-        phase: BackupPhase,
-    },
     ResticUnlock,
     ResticBackup {
         paths: Vec<String>,

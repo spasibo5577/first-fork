@@ -349,9 +349,6 @@ fn execute_commands(
                     })
                     .ok();
             }
-            Command::RunBackupPhase { .. } => {
-                // FSM advancement handled via EffectCompleted events.
-            }
             Command::PersistMaintenance => {
                 exec_persist_maintenance(state);
             }
