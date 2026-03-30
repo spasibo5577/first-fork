@@ -1,9 +1,25 @@
 use crate::cratonctl::dto::{
-    BackupRecordDto, CommandResult, DiagnoseResponse, HealthResponse, RecoveryRecordDto,
-    RemediationRecordDto, ServiceDetail, ServiceSummary, StatusSummary,
+    BackupRecordDto, CommandResult, DiagnoseResponse, DoctorReport, HealthResponse,
+    RecoveryRecordDto, RemediationRecordDto, ServiceDetail, ServiceSummary, StatusSummary,
 };
 
-pub fn render_health(health: &HealthResponse) -> String {
+const BANNER: &str = " ██████╗██████╗  █████╗ ████████╗ ██████╗ ███╗   ██╗\n██╔════╝██╔══██╗██╔══██╗╚══██╔══╝██╔═══██╗████╗  ██║\n██║     ██████╔╝███████║   ██║   ██║   ██║██╔██╗ ██║\n██║     ██╔══██╗██╔══██║   ██║   ██║   ██║██║╚██╗██║\n╚██████╗██║  ██║██║  ██║   ██║   ╚██████╔╝██║ ╚████║\n ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═══╝";
+
+#[derive(Debug, Clone, Copy)]
+pub struct Presentation {
+    pub use_color: bool,
+    pub show_banner: bool,
+}
+
+pub fn render_health(health: &HealthResponse, presentation: Presentation) -> String {
+    if health.is_ok() {
+        paint_ok("ok", presentation)
+    } else {
+        format!("unavailable: {}", paint_warn(&health.reason, presentation))
+    }
+}
+
+pub fn render_health_quiet(health: &HealthResponse) -> String {
     if health.is_ok() {
         "ok".into()
     } else {
@@ -11,22 +27,29 @@ pub fn render_health(health: &HealthResponse) -> String {
     }
 }
 
-pub fn render_health_quiet(health: &HealthResponse) -> String {
-    render_health(health)
-}
-
-pub fn render_status(status: &StatusSummary) -> String {
+pub fn render_status(status: &StatusSummary, presentation: Presentation) -> String {
     let disk = status
         .disk_usage_percent
         .map_or_else(|| "unknown".into(), |value| format!("{value}%"));
+    let state_counts = status
+        .state_counts
+        .iter()
+        .map(|(state, count)| format!("{state}={count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
     let mut lines = vec![
-        format!("health: {} ({})", status.health.status, status.health.reason),
+        format!(
+            "health: {} ({})",
+            paint_status(&status.health.status, presentation),
+            status.health.reason
+        ),
         format!(
             "services: {} total, {} degraded",
             status.service_count, status.degraded_count
         ),
-        format!("backup: {}", status.backup_phase),
-        format!("disk: {disk}"),
+        format!("states: {}", paint_meta(&state_counts, presentation)),
+        format!("backup: {}", paint_meta(&status.backup_phase, presentation)),
+        format!("disk: {}", paint_meta(&disk, presentation)),
     ];
 
     if status.shutting_down {
@@ -42,17 +65,20 @@ pub fn render_status(status: &StatusSummary) -> String {
 pub fn render_status_quiet(status: &StatusSummary) -> String {
     format!(
         "{} services={} degraded={} backup={}",
-        status.health.status, status.service_count, status.degraded_count, status.backup_phase
+        status.health.status,
+        status.service_count,
+        status.degraded_count,
+        status.backup_phase
     )
 }
 
-pub fn render_services(services: &[ServiceSummary]) -> String {
+pub fn render_services(services: &[ServiceSummary], presentation: Presentation) -> String {
     let rows: Vec<Vec<String>> = services
         .iter()
         .map(|service| {
             vec![
                 service.id.clone(),
-                service.status.clone(),
+                paint_status(&service.status, presentation),
                 service.summary.clone(),
             ]
         })
@@ -68,20 +94,20 @@ pub fn render_services_quiet(services: &[ServiceSummary]) -> String {
         .join("\n")
 }
 
-pub fn render_service(service: &ServiceDetail) -> String {
+pub fn render_service(service: &ServiceDetail, presentation: Presentation) -> String {
     let mut lines = vec![
         format!("service: {}", service.id),
-        format!("status: {}", service.status),
+        format!("status: {}", paint_status(&service.status, presentation)),
         format!("summary: {}", service.summary),
     ];
 
-    if let Some(since_mono) = service.since_mono {
-        lines.push(format!("since_mono: {since_mono}"));
+    if service.since_mono.is_some() {
+        lines.push("age: unavailable over current API".into());
     }
 
     match &service.raw_status {
-        crate::cratonctl::dto::ServiceStatusDto::Suppressed { until_mono } => {
-            lines.push(format!("until_mono: {until_mono}"));
+        crate::cratonctl::dto::ServiceStatusDto::Suppressed { .. } => {
+            lines.push("breaker: open".into());
         }
         crate::cratonctl::dto::ServiceStatusDto::BlockedByDep { root } => {
             lines.push(format!("root_dependency: {root}"));
@@ -102,7 +128,7 @@ pub fn render_service_quiet(service: &ServiceDetail) -> String {
     format!("{}\t{}", service.id, service.status)
 }
 
-pub fn render_recovery_history(items: &[RecoveryRecordDto]) -> String {
+pub fn render_recovery_history(items: &[RecoveryRecordDto], presentation: Presentation) -> String {
     let rows: Vec<Vec<String>> = items
         .iter()
         .map(|item| {
@@ -110,7 +136,11 @@ pub fn render_recovery_history(items: &[RecoveryRecordDto]) -> String {
                 item.mono.to_string(),
                 csv_or_dash(&item.recovered),
                 csv_or_dash(&item.failed),
-                yes_no(item.docker_restarted).into(),
+                if item.docker_restarted {
+                    paint_warn("yes", presentation)
+                } else {
+                    "no".into()
+                },
                 item.duration_ms.to_string(),
             ]
         })
@@ -137,13 +167,17 @@ pub fn render_recovery_history_quiet(items: &[RecoveryRecordDto]) -> String {
     render_empty_or_lines(&lines)
 }
 
-pub fn render_backup_history(items: &[BackupRecordDto]) -> String {
+pub fn render_backup_history(items: &[BackupRecordDto], presentation: Presentation) -> String {
     let rows: Vec<Vec<String>> = items
         .iter()
         .map(|item| {
             vec![
                 item.mono.to_string(),
-                if item.success { "success" } else { "failed" }.into(),
+                if item.success {
+                    paint_ok("success", presentation)
+                } else {
+                    paint_fail("failed", presentation)
+                },
                 yes_no(item.partial).into(),
                 item.duration_secs.to_string(),
                 item.error.clone().unwrap_or_else(|| "-".into()),
@@ -169,7 +203,10 @@ pub fn render_backup_history_quiet(items: &[BackupRecordDto]) -> String {
     render_empty_or_lines(&lines)
 }
 
-pub fn render_remediation_history(items: &[RemediationRecordDto]) -> String {
+pub fn render_remediation_history(
+    items: &[RemediationRecordDto],
+    presentation: Presentation,
+) -> String {
     let rows: Vec<Vec<String>> = items
         .iter()
         .map(|item| {
@@ -178,7 +215,7 @@ pub fn render_remediation_history(items: &[RemediationRecordDto]) -> String {
                 item.action.clone(),
                 item.target.clone().unwrap_or_else(|| "-".into()),
                 item.source.clone(),
-                item.result.clone(),
+                paint_meta(&item.result, presentation),
             ]
         })
         .collect();
@@ -201,11 +238,18 @@ pub fn render_remediation_history_quiet(items: &[RemediationRecordDto]) -> Strin
     render_empty_or_lines(&lines)
 }
 
-pub fn render_diagnose(diagnose: &DiagnoseResponse) -> String {
+pub fn render_diagnose(diagnose: &DiagnoseResponse, presentation: Presentation) -> String {
     [
         format!("service: {}", diagnose.service),
         format!("unit: {}", diagnose.unit),
-        format!("active: {}", yes_no(diagnose.active)),
+        format!(
+            "active: {}",
+            if diagnose.active {
+                paint_ok("yes", presentation)
+            } else {
+                paint_fail("no", presentation)
+            }
+        ),
         String::new(),
         "systemctl status:".into(),
         non_empty_block(&diagnose.systemctl_status),
@@ -225,14 +269,15 @@ pub fn render_diagnose_quiet(diagnose: &DiagnoseResponse) -> String {
     )
 }
 
-pub fn render_command_result(result: &CommandResult) -> String {
+pub fn render_command_result(result: &CommandResult, presentation: Presentation) -> String {
+    let accepted = paint_ok("accepted", presentation);
     match (&result.target, &result.detail) {
         (Some(target), Some(detail)) => {
-            format!("accepted: {} {} ({detail})", result.action, target)
+            format!("{accepted}: {} {} ({detail})", result.action, target)
         }
-        (Some(target), None) => format!("accepted: {} {}", result.action, target),
-        (None, Some(detail)) => format!("accepted: {} ({detail})", result.action),
-        (None, None) => format!("accepted: {}", result.action),
+        (Some(target), None) => format!("{accepted}: {} {}", result.action, target),
+        (None, Some(detail)) => format!("{accepted}: {} ({detail})", result.action),
+        (None, None) => format!("{accepted}: {}", result.action),
     }
 }
 
@@ -240,15 +285,81 @@ pub fn render_command_result_quiet(result: &CommandResult) -> String {
     result.status.clone()
 }
 
+pub fn render_doctor(report: &DoctorReport, presentation: Presentation) -> String {
+    let rows = report
+        .checks
+        .iter()
+        .map(|check| {
+            vec![
+                paint_check_status(&check.status, presentation),
+                check.name.clone(),
+                check.detail.clone(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let mut out = Vec::new();
+    if presentation.show_banner {
+        out.push(BANNER.into());
+    }
+    out.push(format!("url: {}", paint_meta(&report.url, presentation)));
+    out.push(render_table(&["STATE", "CHECK", "DETAIL"], &rows));
+    out.push(format!(
+        "summary: read_only={} mutating={}",
+        if report.read_only_ready {
+            paint_ok("yes", presentation)
+        } else {
+            paint_fail("no", presentation)
+        },
+        if report.mutating_ready {
+            paint_ok("yes", presentation)
+        } else {
+            paint_warn("no", presentation)
+        }
+    ));
+    out.join("\n\n")
+}
+
+pub fn render_doctor_quiet(report: &DoctorReport) -> String {
+    report
+        .checks
+        .iter()
+        .map(|check| format!("{}\t{}\t{}", check.status, check.name, check.code))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub fn render_help(usage: &str, presentation: Presentation) -> String {
+    let mut out = Vec::new();
+    if presentation.show_banner {
+        out.push(BANNER.into());
+        out.push(String::new());
+    }
+
+    for line in usage.lines() {
+        if line.ends_with(':') {
+            out.push(paint_section(line, presentation));
+        } else if line.starts_with("  ") {
+            out.push(format!("  {}", line.trim_start()));
+        } else {
+            out.push(line.into());
+        }
+    }
+
+    out.join("\n")
+}
+
 fn render_table(headers: &[&str], rows: &[Vec<String>]) -> String {
     let mut widths: Vec<usize> = headers.iter().map(|value| value.len()).collect();
     for row in rows {
         for (index, cell) in row.iter().enumerate() {
-            widths[index] = widths[index].max(cell.len());
+            widths[index] = widths[index].max(display_width(cell));
         }
     }
 
-    let header_line = join_row(headers.iter().map(std::string::ToString::to_string).collect(), &widths);
+    let header_line = join_row(
+        headers.iter().map(std::string::ToString::to_string).collect(),
+        &widths,
+    );
     let divider = widths
         .iter()
         .map(|width| "-".repeat(*width))
@@ -271,7 +382,7 @@ fn join_row(values: Vec<String>, widths: &[usize]) -> String {
     values
         .into_iter()
         .enumerate()
-        .map(|(index, value)| format!("{value:<width$}", width = widths[index]))
+        .map(|(index, value)| pad_display(&value, widths[index]))
         .collect::<Vec<_>>()
         .join(" | ")
 }
@@ -309,9 +420,87 @@ fn render_empty_or_lines(lines: &str) -> String {
     }
 }
 
+fn paint_status(status: &str, presentation: Presentation) -> String {
+    match status {
+        "healthy" => paint_ok(status, presentation),
+        "recovering" | "unknown" | "blocked" => paint_warn(status, presentation),
+        "failed" | "unhealthy" | "breaker_open" => paint_fail(status, presentation),
+        _ => status.into(),
+    }
+}
+
+fn paint_check_status(status: &str, presentation: Presentation) -> String {
+    match status {
+        "ok" => paint_ok("OK", presentation),
+        "warn" => paint_warn("WARN", presentation),
+        "fail" => paint_fail("FAIL", presentation),
+        _ => status.to_uppercase(),
+    }
+}
+
+fn paint_section(text: &str, presentation: Presentation) -> String {
+    paint(text, "36;1", presentation)
+}
+
+fn paint_ok(text: &str, presentation: Presentation) -> String {
+    paint(text, "32", presentation)
+}
+
+fn paint_warn(text: &str, presentation: Presentation) -> String {
+    paint(text, "33", presentation)
+}
+
+fn paint_fail(text: &str, presentation: Presentation) -> String {
+    paint(text, "31", presentation)
+}
+
+fn paint_meta(text: &str, presentation: Presentation) -> String {
+    paint(text, "2", presentation)
+}
+
+fn paint(text: &str, code: &str, presentation: Presentation) -> String {
+    if presentation.use_color {
+        format!("\u{1b}[{code}m{text}\u{1b}[0m")
+    } else {
+        text.into()
+    }
+}
+
+fn pad_display(value: &str, width: usize) -> String {
+    let visible = display_width(value);
+    if visible >= width {
+        value.into()
+    } else {
+        format!("{value}{}", " ".repeat(width - visible))
+    }
+}
+
+fn display_width(value: &str) -> usize {
+    let mut width = 0usize;
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' && chars.peek() == Some(&'[') {
+            let _ = chars.next();
+            for code_ch in chars.by_ref() {
+                if code_ch.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        width += 1;
+    }
+    width
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PLAIN: Presentation = Presentation {
+        use_color: false,
+        show_banner: false,
+    };
 
     #[test]
     fn health_renderer_is_compact() {
@@ -319,17 +508,59 @@ mod tests {
             status: "ok".into(),
             reason: "ok".into(),
         };
-        assert_eq!(render_health(&health), "ok");
+        assert_eq!(render_health(&health, PLAIN), "ok");
     }
 
     #[test]
     fn services_renderer_contains_header() {
-        let rendered = render_services(&[ServiceSummary {
+        let rendered = render_services(
+            &[ServiceSummary {
+                id: "ntfy".into(),
+                status: "healthy".into(),
+                summary: "healthy".into(),
+            }],
+            PLAIN,
+        );
+        assert!(rendered.contains("SERVICE"));
+        assert!(rendered.contains("ntfy"));
+    }
+
+    #[test]
+    fn service_renderer_hides_raw_monotonic_fields_in_human_output() {
+        let detail = ServiceDetail {
             id: "ntfy".into(),
             status: "healthy".into(),
             summary: "healthy".into(),
-        }]);
-        assert!(rendered.contains("SERVICE"));
-        assert!(rendered.contains("ntfy"));
+            since_mono: Some(123),
+            raw_status: crate::cratonctl::dto::ServiceStatusDto::Healthy { since_mono: 123 },
+        };
+
+        let rendered = render_service(&detail, PLAIN);
+        assert!(rendered.contains("age: unavailable over current API"));
+        assert!(!rendered.contains("since_mono: 123"));
+    }
+
+    #[test]
+    fn colored_tables_keep_columns_aligned() {
+        let rendered = render_services(
+            &[
+                ServiceSummary {
+                    id: "alpha".into(),
+                    status: "healthy".into(),
+                    summary: "healthy".into(),
+                },
+                ServiceSummary {
+                    id: "beta".into(),
+                    status: "failed".into(),
+                    summary: "failed".into(),
+                },
+            ],
+            Presentation {
+                use_color: true,
+                show_banner: false,
+            },
+        );
+        let lines = rendered.lines().collect::<Vec<_>>();
+        assert_eq!(lines[2].find('|'), lines[3].find('|'));
     }
 }

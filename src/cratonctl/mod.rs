@@ -7,6 +7,7 @@ pub mod output;
 
 use crate::cratonctl::error::CratonctlError;
 use serde::Serialize;
+use std::io::IsTerminal;
 
 pub fn run(args: Vec<String>) -> i32 {
     let json_errors = args.iter().any(|arg| arg == "--json");
@@ -20,16 +21,22 @@ pub fn run(args: Vec<String>) -> i32 {
 }
 
 fn run_cli(parsed: &cli::Cli) -> Result<i32, CratonctlError> {
+    if let cli::Command::Help { text, top_level } = &parsed.command {
+        return Ok(handle_help(&parsed.global, text, *top_level));
+    }
+
     let resolved = auth::resolve(&parsed.global)?;
     let client = client::Client::new(&resolved.url);
 
     match &parsed.command {
+        cli::Command::Help { .. } => unreachable!("help commands return before client setup"),
         cli::Command::Health => handle_health(&client, &parsed.global),
         cli::Command::Status => handle_status(&client, &parsed.global),
         cli::Command::Services => handle_services(&client, &parsed.global),
         cli::Command::Service { id } => handle_service(&client, &parsed.global, id),
         cli::Command::History { kind } => handle_history(&client, &parsed.global, *kind),
         cli::Command::Diagnose { service } => handle_diagnose(&client, &parsed.global, service),
+        cli::Command::Doctor => handle_doctor(&client, &resolved, &parsed.global),
         cli::Command::Trigger { task } => handle_trigger(&client, &resolved, &parsed.global, task),
         cli::Command::Restart { service } => handle_remediation_command(&client, &resolved, &parsed.global, RemediationSpec {
             action: "RestartService",
@@ -98,10 +105,11 @@ fn handle_health(
     global: &cli::GlobalArgs,
 ) -> Result<i32, CratonctlError> {
     let health = client.get_json::<dto::HealthResponse>("/health")?;
+    let presentation = default_presentation(global);
     render(
         &health,
         global,
-        || output::render_health(&health),
+        || output::render_health(&health, presentation),
         || output::render_health_quiet(&health),
     )?;
     Ok(i32::from(!health.is_ok()))
@@ -114,10 +122,11 @@ fn handle_status(
     let health = client.get_json::<dto::HealthResponse>("/health")?;
     let state = client.get_json::<dto::StateSnapshot>("/api/v1/state")?;
     let status = dto::StatusSummary::from_parts(health, &state);
+    let presentation = default_presentation(global);
     render(
         &status,
         global,
-        || output::render_status(&status),
+        || output::render_status(&status, presentation),
         || output::render_status_quiet(&status),
     )?;
     Ok(i32::from(!status.health.is_ok()))
@@ -129,10 +138,11 @@ fn handle_services(
 ) -> Result<i32, CratonctlError> {
     let state = client.get_json::<dto::StateSnapshot>("/api/v1/state")?;
     let services = dto::ServiceSummary::list_from_snapshot(state);
+    let presentation = default_presentation(global);
     render(
         &services,
         global,
-        || output::render_services(&services),
+        || output::render_services(&services, presentation),
         || output::render_services_quiet(&services),
     )?;
     Ok(0)
@@ -146,10 +156,11 @@ fn handle_service(
     let state = client.get_json::<dto::StateSnapshot>("/api/v1/state")?;
     let service = dto::ServiceDetail::from_snapshot(&state, id)
         .ok_or_else(|| CratonctlError::Daemon(format!("service not found: {id}")))?;
+    let presentation = default_presentation(global);
     render(
         &service,
         global,
-        || output::render_service(&service),
+        || output::render_service(&service, presentation),
         || output::render_service_quiet(&service),
     )?;
     Ok(0)
@@ -160,13 +171,14 @@ fn handle_history(
     global: &cli::GlobalArgs,
     kind: cli::HistoryKind,
 ) -> Result<i32, CratonctlError> {
+    let presentation = default_presentation(global);
     match kind {
         cli::HistoryKind::Recovery => {
             let items = client.get_json::<Vec<dto::RecoveryRecordDto>>("/api/v1/history/recovery")?;
             render(
                 &items,
                 global,
-                || output::render_recovery_history(&items),
+                || output::render_recovery_history(&items, presentation),
                 || output::render_recovery_history_quiet(&items),
             )?;
         }
@@ -175,7 +187,7 @@ fn handle_history(
             render(
                 &items,
                 global,
-                || output::render_backup_history(&items),
+                || output::render_backup_history(&items, presentation),
                 || output::render_backup_history_quiet(&items),
             )?;
         }
@@ -185,7 +197,7 @@ fn handle_history(
             render(
                 &items,
                 global,
-                || output::render_remediation_history(&items),
+                || output::render_remediation_history(&items, presentation),
                 || output::render_remediation_history_quiet(&items),
             )?;
         }
@@ -200,13 +212,153 @@ fn handle_diagnose(
 ) -> Result<i32, CratonctlError> {
     let path = format!("/api/v1/diagnose/{}", client::path_segment(service));
     let diagnose = client.get_json::<dto::DiagnoseResponse>(&path)?;
+    let presentation = default_presentation(global);
     render(
         &diagnose,
         global,
-        || output::render_diagnose(&diagnose),
+        || output::render_diagnose(&diagnose, presentation),
         || output::render_diagnose_quiet(&diagnose),
     )?;
     Ok(0)
+}
+
+fn handle_doctor(
+    client: &client::Client,
+    resolved: &auth::ResolvedConfig,
+    global: &cli::GlobalArgs,
+) -> Result<i32, CratonctlError> {
+    let mut checks = build_health_checks(client);
+    let state_result = client.get_json::<dto::StateSnapshot>("/api/v1/state");
+    match &state_result {
+        Ok(state) => checks.push(dto::DoctorCheck {
+            name: "GET /api/v1/state".into(),
+            status: "ok".into(),
+            code: "state_ok".into(),
+            detail: format!("parsed state snapshot for {} services", state.services.len()),
+        }),
+        Err(error) => checks.push(dto::DoctorCheck {
+            name: "GET /api/v1/state".into(),
+            status: "fail".into(),
+            code: "state_request_failed".into(),
+            detail: error.message(),
+        }),
+    }
+
+    let token_check = auth::diagnose_token(resolved);
+    checks.push(dto::DoctorCheck {
+        name: "token access".into(),
+        status: token_check.status.into(),
+        code: token_check.code.into(),
+        detail: token_check.detail,
+    });
+
+    let read_only_ready = checks_read_only_ready(&checks) && state_result.is_ok();
+    let mutating_ready = auth::require_token(resolved).is_ok();
+    checks.push(read_only_check(read_only_ready));
+    checks.push(mutating_check(mutating_ready));
+
+    let report = dto::DoctorReport {
+        url: resolved.url.clone(),
+        checks,
+        read_only_ready,
+        mutating_ready,
+    };
+    let presentation = doctor_presentation(global);
+    render(
+        &report,
+        global,
+        || output::render_doctor(&report, presentation),
+        || output::render_doctor_quiet(&report),
+    )?;
+    Ok(i32::from(report.has_failures()))
+}
+
+fn build_health_checks(client: &client::Client) -> Vec<dto::DoctorCheck> {
+    let health_result = client.get_json::<dto::HealthResponse>("/health");
+    match health_result {
+        Ok(health) => vec![
+            dto::DoctorCheck {
+                name: "daemon URL".into(),
+                status: "ok".into(),
+                code: "daemon_url_reachable".into(),
+                detail: "daemon URL is reachable".into(),
+            },
+            dto::DoctorCheck {
+                name: "GET /health".into(),
+                status: if health.is_ok() { "ok" } else { "warn" }.into(),
+                code: if health.is_ok() {
+                    "health_ok".into()
+                } else {
+                    "health_unavailable".into()
+                },
+                detail: format!("status={} reason={}", health.status, health.reason),
+            },
+        ],
+        Err(error) => vec![
+            dto::DoctorCheck {
+                name: "daemon URL".into(),
+                status: if matches!(error, CratonctlError::Transport(_)) {
+                    "fail"
+                } else {
+                    "ok"
+                }
+                .into(),
+                code: if matches!(error, CratonctlError::Transport(_)) {
+                    "daemon_url_unreachable".into()
+                } else {
+                    "daemon_url_reachable".into()
+                },
+                detail: error.message(),
+            },
+            dto::DoctorCheck {
+                name: "GET /health".into(),
+                status: "fail".into(),
+                code: "health_request_failed".into(),
+                detail: error.message(),
+            },
+        ],
+    }
+}
+
+fn checks_read_only_ready(checks: &[dto::DoctorCheck]) -> bool {
+    checks
+        .iter()
+        .find(|check| check.name == "GET /health")
+        .is_some_and(|check| check.status != "fail")
+}
+
+fn read_only_check(read_only_ready: bool) -> dto::DoctorCheck {
+    dto::DoctorCheck {
+        name: "read-only commands".into(),
+        status: if read_only_ready { "ok" } else { "fail" }.into(),
+        code: if read_only_ready {
+            "read_only_ready".into()
+        } else {
+            "read_only_not_ready".into()
+        },
+        detail: if read_only_ready {
+            "basic read-only preconditions look good".into()
+        } else {
+            "one or more daemon API checks failed".into()
+        },
+    }
+}
+
+fn mutating_check(mutating_ready: bool) -> dto::DoctorCheck {
+    dto::DoctorCheck {
+        name: "mutating commands".into(),
+        status: if mutating_ready { "ok" } else { "warn" }.into(),
+        code: if mutating_ready {
+            "mutating_ready".into()
+        } else {
+            "mutating_not_ready".into()
+        },
+        detail: if mutating_ready {
+            "token looks usable for mutating commands".into()
+        } else {
+            "mutating commands are not currently ready".into()
+        },
+    }
 }
 
 fn handle_trigger(
@@ -224,10 +376,11 @@ fn handle_trigger(
         target: response.task.or_else(|| Some(task.into())),
         detail: None,
     };
+    let presentation = default_presentation(global);
     render(
         &result,
         global,
-        || output::render_command_result(&result),
+        || output::render_command_result(&result, presentation),
         || output::render_command_result_quiet(&result),
     )?;
     Ok(0)
@@ -248,13 +401,29 @@ fn handle_remediation_command(
         spec.label,
         spec.display_target,
     )?;
+    let presentation = default_presentation(global);
     render(
         &result,
         global,
-        || output::render_command_result(&result),
+        || output::render_command_result(&result, presentation),
         || output::render_command_result_quiet(&result),
     )?;
     Ok(0)
+}
+
+fn handle_help(global: &cli::GlobalArgs, help_text: &str, top_level: bool) -> i32 {
+    let base_help = if top_level {
+        cli::usage()
+    } else {
+        help_text.to_owned()
+    };
+    let text = if global.json || global.quiet || !top_level {
+        base_help
+    } else {
+        output::render_help(&base_help, help_presentation(global))
+    };
+    println!("{text}");
+    0
 }
 
 fn remediate(
@@ -318,6 +487,7 @@ fn emit_error(error: &CratonctlError, json_errors: bool) {
         let value = serde_json::json!({
             "error": {
                 "kind": error.kind(),
+                "code": error.code(),
                 "message": error.message(),
                 "exit_code": error.exit_code(),
             }
@@ -326,4 +496,33 @@ fn emit_error(error: &CratonctlError, json_errors: bool) {
     } else {
         eprintln!("{error}");
     }
+}
+
+fn default_presentation(global: &cli::GlobalArgs) -> output::Presentation {
+    output::Presentation {
+        use_color: use_color(global),
+        show_banner: false,
+    }
+}
+
+fn doctor_presentation(global: &cli::GlobalArgs) -> output::Presentation {
+    output::Presentation {
+        use_color: use_color(global),
+        show_banner: show_banner(global),
+    }
+}
+
+fn help_presentation(global: &cli::GlobalArgs) -> output::Presentation {
+    output::Presentation {
+        use_color: use_color(global),
+        show_banner: show_banner(global),
+    }
+}
+
+fn use_color(global: &cli::GlobalArgs) -> bool {
+    !global.json && !global.no_color && std::io::stdout().is_terminal()
+}
+
+fn show_banner(global: &cli::GlobalArgs) -> bool {
+    !global.json && !global.quiet && std::io::stdout().is_terminal()
 }

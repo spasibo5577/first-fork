@@ -54,8 +54,8 @@ impl ServiceStatusDto {
             Self::Unhealthy { .. } => "unhealthy",
             Self::Recovering { .. } => "recovering",
             Self::Failed { .. } => "failed",
-            Self::BlockedByDep { .. } => "blocked_by_dep",
-            Self::Suppressed { .. } => "suppressed",
+            Self::BlockedByDep { .. } => "blocked",
+            Self::Suppressed { .. } => "breaker_open",
         }
     }
 
@@ -67,13 +67,13 @@ impl ServiceStatusDto {
     #[must_use]
     pub fn summary(&self) -> String {
         match self {
-            Self::Unknown => "unknown".into(),
+            Self::Unknown => "no probe state yet".into(),
             Self::Healthy { .. } => "healthy".into(),
             Self::Unhealthy { error, .. } => format!("unhealthy: {error}"),
             Self::Recovering { attempt, .. } => format!("recovering (attempt {attempt})"),
             Self::Failed { error, .. } => format!("failed: {error}"),
             Self::BlockedByDep { root } => format!("blocked by dependency: {root}"),
-            Self::Suppressed { .. } => "suppressed by breaker".into(),
+            Self::Suppressed { .. } => "breaker open".into(),
         }
     }
 
@@ -87,6 +87,7 @@ impl ServiceStatusDto {
             Self::Unknown | Self::BlockedByDep { .. } | Self::Suppressed { .. } => None,
         }
     }
+
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,6 +170,7 @@ pub struct StatusSummary {
     pub health: HealthResponse,
     pub service_count: usize,
     pub degraded_count: usize,
+    pub state_counts: BTreeMap<String, usize>,
     pub backup_phase: String,
     pub disk_usage_percent: Option<u32>,
     pub shutting_down: bool,
@@ -180,6 +182,11 @@ pub struct StatusSummary {
 impl StatusSummary {
     #[must_use]
     pub fn from_parts(health: HealthResponse, state: &StateSnapshot) -> Self {
+        let mut state_counts = BTreeMap::new();
+        for status in state.services.values() {
+            *state_counts.entry(status.status_name().into()).or_insert(0) += 1;
+        }
+
         let degraded_count = state
             .services
             .values()
@@ -190,6 +197,7 @@ impl StatusSummary {
             health,
             service_count: state.services.len(),
             degraded_count,
+            state_counts,
             backup_phase: state.backup_phase.phase_name().into(),
             disk_usage_percent: state.disk_usage_percent,
             shutting_down: state.shutting_down,
@@ -210,14 +218,20 @@ pub struct ServiceSummary {
 impl ServiceSummary {
     #[must_use]
     pub fn list_from_snapshot(state: StateSnapshot) -> Vec<Self> {
-        state.services
+        let mut services: Vec<Self> = state.services
             .into_iter()
             .map(|(id, status)| Self {
                 id,
                 status: status.status_name().into(),
                 summary: status.summary(),
             })
-            .collect()
+            .collect();
+        services.sort_by(|left, right| {
+            let left_rank = state_rank(&left.status);
+            let right_rank = state_rank(&right.status);
+            left_rank.cmp(&right_rank).then_with(|| left.id.cmp(&right.id))
+        });
+        services
     }
 }
 
@@ -238,6 +252,29 @@ pub struct CommandResult {
     pub detail: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct DoctorCheck {
+    pub name: String,
+    pub status: String,
+    pub code: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DoctorReport {
+    pub url: String,
+    pub checks: Vec<DoctorCheck>,
+    pub read_only_ready: bool,
+    pub mutating_ready: bool,
+}
+
+impl DoctorReport {
+    #[must_use]
+    pub fn has_failures(&self) -> bool {
+        self.checks.iter().any(|check| check.status == "fail")
+    }
+}
+
 impl ServiceDetail {
     #[must_use]
     pub fn from_snapshot(state: &StateSnapshot, id: &str) -> Option<Self> {
@@ -249,5 +286,18 @@ impl ServiceDetail {
             since_mono: status.timing(),
             raw_status: status,
         })
+    }
+}
+
+fn state_rank(status: &str) -> u8 {
+    match status {
+        "failed" => 0,
+        "unhealthy" => 1,
+        "breaker_open" => 2,
+        "blocked" => 3,
+        "recovering" => 4,
+        "unknown" => 5,
+        "healthy" => 6,
+        _ => 7,
     }
 }
