@@ -89,7 +89,10 @@ pub fn parse(args: Vec<String>) -> Result<Cli, CratonctlError> {
             }
             "--help" | "-h" => return Err(CratonctlError::Usage(usage())),
             value if value.starts_with("--") => {
-                return Err(CratonctlError::Usage(format!("unknown flag: {value}")));
+                return Err(CratonctlError::Usage(format!(
+                    "unknown flag: {value}\n\n{}",
+                    usage()
+                )));
             }
             _ => break,
         }
@@ -168,13 +171,45 @@ fn parse_history_kind(value: &str) -> Result<HistoryKind, CratonctlError> {
         "backup" => Ok(HistoryKind::Backup),
         "remediation" => Ok(HistoryKind::Remediation),
         _ => Err(CratonctlError::Usage(format!(
-            "unknown history kind: {value}"
+            "unknown history kind: {value}\nexpected one of: recovery, backup, remediation"
         ))),
     }
 }
 
 fn usage() -> String {
-    "cratonctl [--url URL] [--token TOKEN] [--token-file PATH] [--json] [--quiet] [--no-color] <command>\ncommands: health | status | services | service <id> | history <recovery|backup|remediation> | diagnose <service> | trigger <task> | restart <service> | maintenance set <service> --reason <text> | maintenance clear <service> | breaker clear <service> | flapping clear <service> | backup run | backup unlock | disk cleanup".into()
+    [
+        "Usage:",
+        "  cratonctl [global options] <command>",
+        "",
+        "Global options:",
+        "  --url <url>            Daemon base URL",
+        "  --token <token>        Bearer token for mutating commands",
+        "  --token-file <path>    Token file for mutating commands",
+        "  --json                 Print a single JSON document",
+        "  --quiet                Minimize human-readable output",
+        "  --no-color             Disable color output",
+        "  -h, --help             Show this help text",
+        "",
+        "Read-only commands:",
+        "  health",
+        "  status",
+        "  services",
+        "  service <id>",
+        "  history <recovery|backup|remediation>",
+        "  diagnose <service>",
+        "",
+        "Mutating commands:",
+        "  trigger <task>",
+        "  restart <service>",
+        "  maintenance set <service> --reason <text>",
+        "  maintenance clear <service>",
+        "  breaker clear <service>",
+        "  flapping clear <service>",
+        "  backup run",
+        "  backup unlock",
+        "  disk cleanup",
+    ]
+    .join("\n")
 }
 
 #[cfg(test)]
@@ -241,5 +276,13 @@ mod tests {
                 reason: "manual work".into()
             }
         );
+    }
+
+    #[test]
+    fn usage_contains_sections() {
+        let text = usage();
+        assert!(text.contains("Global options:"));
+        assert!(text.contains("Read-only commands:"));
+        assert!(text.contains("Mutating commands:"));
     }
 }

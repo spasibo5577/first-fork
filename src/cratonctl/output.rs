@@ -7,7 +7,7 @@ pub fn render_health(health: &HealthResponse) -> String {
     if health.is_ok() {
         "ok".into()
     } else {
-        format!("unavailable (reason={})", health.reason)
+        format!("unavailable: {}", health.reason)
     }
 }
 

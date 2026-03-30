@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "cargo": {
+      "command": "cargo",
+      "args": ["metadata", "--format-version=1"],
+      "description": "Cargo project metadata and dependency information"
+    },
+    "rust-docs": {
+      "command": "rustup",
+      "args": ["doc", "--open"],
+      "description": "Access Rust standard library and dependency documentation"
+    }
+  }
+}

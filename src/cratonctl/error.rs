@@ -44,11 +44,11 @@ impl CratonctlError {
 impl Display for CratonctlError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Usage(msg) => write!(f, "usage error: {msg}"),
-            Self::Config(msg) => write!(f, "config error: {msg}"),
-            Self::Transport(msg) => write!(f, "transport error: {msg}"),
-            Self::Parse(msg) => write!(f, "parse error: {msg}"),
-            Self::Daemon(msg) => write!(f, "daemon error: {msg}"),
+            Self::Usage(msg) => write!(f, "invalid arguments:\n{msg}"),
+            Self::Config(msg) => write!(f, "configuration error: {msg}"),
+            Self::Transport(msg) => write!(f, "request failed: {msg}"),
+            Self::Parse(msg) => write!(f, "invalid response: {msg}"),
+            Self::Daemon(msg) => write!(f, "daemon rejected request: {msg}"),
         }
     }
 }
