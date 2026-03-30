@@ -86,44 +86,34 @@ fn handle_health(snapshot: &SharedSnapshot) -> tiny_http::Response<std::io::Curs
         Err(_) => "{}".to_string(),
     };
 
-    // Check heartbeat freshness: snapshot must have been published within 30s.
+    let parsed = serde_json::from_str::<serde_json::Value>(&snap).unwrap_or_default();
     let now_epoch = epoch_secs_now();
-    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&snap) {
-        if let Some(published) = parsed
-            .get("snapshot_epoch_secs")
-            .and_then(serde_json::Value::as_u64)
-        {
-            if now_epoch.saturating_sub(published) > 30 {
-                return json_response(
-                    503,
-                    r#"{"status":"unavailable","reason":"control loop heartbeat stale"}"#,
-                );
-            }
-        }
+
+    let stale_snapshot = parsed
+        .get("snapshot_epoch_secs")
+        .and_then(serde_json::Value::as_u64)
+        .is_none_or(|published| now_epoch.saturating_sub(published) > 30);
+    if stale_snapshot {
+        return json_response(503, r#"{"status":"unavailable","reason":"stale_snapshot"}"#);
     }
 
-    // Check outbox overflow.
-    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&snap) {
-        if parsed
-            .get("outbox_overflow")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-        {
-            return json_response(
-                503,
-                r#"{"status":"unavailable","reason":"alert outbox overflow — undelivered alerts lost"}"#,
-            );
-        }
+    let outbox_overflow = parsed
+        .get("outbox_overflow")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if outbox_overflow {
+        return json_response(503, r#"{"status":"unavailable","reason":"outbox_overflow"}"#);
     }
 
-    let status = if snap.contains("\"unhealthy\"") || snap.contains("\"failed\"") {
-        "degraded"
-    } else {
-        "ok"
-    };
+    let shutting_down = parsed
+        .get("shutting_down")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if shutting_down {
+        return json_response(503, r#"{"status":"unavailable","reason":"shutting_down"}"#);
+    }
 
-    let body = format!(r#"{{"status":"{status}"}}"#);
-    json_response(200, &body)
+    json_response(200, r#"{"status":"ok","reason":"ok"}"#)
 }
 
 fn epoch_secs_now() -> u64 {
@@ -364,18 +354,115 @@ mod tests {
     use super::*;
     use std::io::Read;
 
+    fn read_json(
+        resp: tiny_http::Response<std::io::Cursor<Vec<u8>>>,
+    ) -> (tiny_http::StatusCode, serde_json::Value) {
+        let status = resp.status_code();
+        let mut body = String::new();
+        resp.into_reader().read_to_string(&mut body).unwrap();
+        let data: serde_json::Value = serde_json::from_str(&body).unwrap();
+        (status, data)
+    }
+
+    fn snapshot_with(value: &serde_json::Value) -> SharedSnapshot {
+        Arc::new(Mutex::new(value.to_string()))
+    }
+
+    #[test]
+    fn health_returns_200_for_fresh_snapshot() {
+        let snapshot_value = serde_json::json!({
+            "snapshot_epoch_secs": epoch_secs_now(),
+            "outbox_overflow": false,
+            "shutting_down": false,
+            "services": {}
+        });
+        let snapshot = snapshot_with(&snapshot_value);
+
+        let (status, data) = read_json(handle_health(&snapshot));
+
+        assert_eq!(status, tiny_http::StatusCode(200));
+        assert_eq!(data["status"], "ok");
+        assert_eq!(data["reason"], "ok");
+    }
+
+    #[test]
+    fn health_returns_503_for_stale_snapshot() {
+        let snapshot_value = serde_json::json!({
+            "snapshot_epoch_secs": epoch_secs_now().saturating_sub(31),
+            "outbox_overflow": false,
+            "shutting_down": false,
+            "services": {}
+        });
+        let snapshot = snapshot_with(&snapshot_value);
+
+        let (status, data) = read_json(handle_health(&snapshot));
+
+        assert_eq!(status, tiny_http::StatusCode(503));
+        assert_eq!(data["status"], "unavailable");
+        assert_eq!(data["reason"], "stale_snapshot");
+    }
+
+    #[test]
+    fn health_returns_503_for_outbox_overflow() {
+        let snapshot_value = serde_json::json!({
+            "snapshot_epoch_secs": epoch_secs_now(),
+            "outbox_overflow": true,
+            "shutting_down": false,
+            "services": {}
+        });
+        let snapshot = snapshot_with(&snapshot_value);
+
+        let (status, data) = read_json(handle_health(&snapshot));
+
+        assert_eq!(status, tiny_http::StatusCode(503));
+        assert_eq!(data["status"], "unavailable");
+        assert_eq!(data["reason"], "outbox_overflow");
+    }
+
+    #[test]
+    fn health_returns_503_when_shutting_down() {
+        let snapshot_value = serde_json::json!({
+            "snapshot_epoch_secs": epoch_secs_now(),
+            "outbox_overflow": false,
+            "shutting_down": true,
+            "services": {}
+        });
+        let snapshot = snapshot_with(&snapshot_value);
+
+        let (status, data) = read_json(handle_health(&snapshot));
+
+        assert_eq!(status, tiny_http::StatusCode(503));
+        assert_eq!(data["status"], "unavailable");
+        assert_eq!(data["reason"], "shutting_down");
+    }
+
+    #[test]
+    fn health_ignores_service_failure_details_when_typed_health_fields_are_ok() {
+        let snapshot_value = serde_json::json!({
+            "snapshot_epoch_secs": epoch_secs_now(),
+            "outbox_overflow": false,
+            "shutting_down": false,
+            "services": {
+                "ntfy": { "status": "failed", "error": "boom", "since_mono": 1 }
+            }
+        });
+        let snapshot = snapshot_with(&snapshot_value);
+
+        let (status, data) = read_json(handle_health(&snapshot));
+
+        assert_eq!(status, tiny_http::StatusCode(200));
+        assert_eq!(data["status"], "ok");
+        assert_eq!(data["reason"], "ok");
+    }
+
     #[test]
     fn history_recovery_returns_only_recovery_list() {
         let snapshot: SharedSnapshot = Arc::new(Mutex::new(
             r#"{"recovery_history":[{"mono":1,"recovered":[],"failed":[],"docker_restarted":false,"duration_ms":0}],"backup_history":[{"mono":2,"success":true,"partial":false,"error":null,"duration_secs":1}],"snapshot_epoch_secs":123}"#.to_string(),
         ));
 
-        let resp = handle_history(&snapshot, "/api/v1/history/recovery");
-        assert_eq!(resp.status_code(), tiny_http::StatusCode(200));
-
-        let mut body = String::new();
-        resp.into_reader().read_to_string(&mut body).unwrap();
-        let data: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let (status, data) = read_json(handle_history(&snapshot, "/api/v1/history/recovery"));
+        assert_eq!(status, tiny_http::StatusCode(200));
         assert!(data.is_array());
         assert_eq!(data[0]["mono"], 1);
     }
@@ -386,12 +473,8 @@ mod tests {
             r#"{"recovery_history":[{"mono":1,"recovered":[],"failed":[],"docker_restarted":false,"duration_ms":0}],"backup_history":[{"mono":2,"success":true,"partial":false,"error":null,"duration_secs":1}],"snapshot_epoch_secs":123}"#.to_string(),
         ));
 
-        let resp = handle_history(&snapshot, "/api/v1/history/backup");
-        assert_eq!(resp.status_code(), tiny_http::StatusCode(200));
-
-        let mut body = String::new();
-        resp.into_reader().read_to_string(&mut body).unwrap();
-        let data: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let (status, data) = read_json(handle_history(&snapshot, "/api/v1/history/backup"));
+        assert_eq!(status, tiny_http::StatusCode(200));
         assert!(data.is_array());
         assert_eq!(data[0]["mono"], 2);
     }
@@ -402,14 +485,28 @@ mod tests {
             r#"{"recovery_history":[{"mono":1,"recovered":[],"failed":[],"docker_restarted":false,"duration_ms":0}],"backup_history":[{"mono":2,"success":true,"partial":false,"error":null,"duration_secs":1}],"snapshot_epoch_secs":123}"#.to_string(),
         ));
 
-        let resp = handle_history(&snapshot, "/api/v1/history/remediation");
-        assert_eq!(resp.status_code(), tiny_http::StatusCode(200));
-
-        let mut body = String::new();
-        resp.into_reader().read_to_string(&mut body).unwrap();
-        let data: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let (status, data) = read_json(handle_history(&snapshot, "/api/v1/history/remediation"));
+        assert_eq!(status, tiny_http::StatusCode(200));
         assert!(data.is_array(), "remediation endpoint should return array");
         assert!(data.as_array().unwrap().is_empty(), "should be empty when not in snapshot");
+    }
+
+    #[test]
+    fn state_returns_snapshot_object_not_array() {
+        let snapshot_value = serde_json::json!({
+            "services": {
+                "ntfy": { "status": "healthy", "since_mono": 1 }
+            },
+            "snapshot_epoch_secs": 123
+        });
+        let snapshot = snapshot_with(&snapshot_value);
+
+        let (status, data) = read_json(handle_state(&snapshot));
+
+        assert_eq!(status, tiny_http::StatusCode(200));
+        assert!(data.is_object());
+        assert!(!data.is_array());
+        assert_eq!(data["snapshot_epoch_secs"], 123);
     }
 }
 

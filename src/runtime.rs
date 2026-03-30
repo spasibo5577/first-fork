@@ -20,18 +20,30 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
+pub struct RuntimeDeps<'a> {
+    pub config: &'a CratonConfig,
+    pub graph: &'a DepGraph,
+    pub snapshot: SharedSnapshot,
+    pub notifier: NotifySender,
+    pub sd_notify: &'a crate::effect::systemd::SdNotify,
+    pub outbox_overflow: Arc<AtomicBool>,
+}
+
 /// Runs the main control loop. Blocks until shutdown.
 #[allow(clippy::needless_pass_by_value)] // Arc/Sender/NotifySender are moved into this thread
 pub fn run_control_loop(
-    config: &CratonConfig,
-    graph: &DepGraph,
+    deps: RuntimeDeps<'_>,
     event_rx: mpsc::Receiver<Event>,
     event_tx: mpsc::Sender<Event>,
-    snapshot: SharedSnapshot,
-    notifier: NotifySender,
-    sd_notify: &crate::effect::systemd::SdNotify,
-    outbox_overflow: Arc<AtomicBool>,
 ) {
+    let RuntimeDeps {
+        config,
+        graph,
+        snapshot,
+        notifier,
+        sd_notify,
+        outbox_overflow,
+    } = deps;
     let mono_start = monotonic_secs();
     let mut state = State::new(config, mono_start);
 
@@ -41,7 +53,10 @@ pub fn run_control_loop(
     // Crash recovery from persisted backup state.
     let persisted_phase = load_persisted_backup_phase();
     if !persisted_phase.is_idle() {
-        eprintln!("[cratond] crash recovery needed: backup phase = {persisted_phase:?}");
+        crate::log::warn(
+            "runtime",
+            &format!("crash recovery needed: backup phase = {persisted_phase:?}"),
+        );
         let event = Event::StartupRecovery {
             persisted_backup: persisted_phase,
         };
@@ -55,15 +70,11 @@ pub fn run_control_loop(
     // Signal ready.
     sd_notify.ready();
     sd_notify.status("running");
-    eprintln!("[cratond] control loop started");
+    crate::log::info("runtime", "control loop started");
 
     notifier.queue(Alert {
         title: "🟢 Кратон запущен".into(),
-        body: format!(
-            "Сервисов: {}, backup: {}",
-            config.services.len(),
-            config.backup.restic_repo
-        ),
+        body: format!("Сервисов под наблюдением: {}", config.services.len()),
         priority: AlertPriority::Default,
         tags: "white_check_mark".into(),
     });
@@ -71,8 +82,10 @@ pub fn run_control_loop(
     // Schedule state.
     let mut last_recovery = Instant::now();
     let mut last_disk = Instant::now();
+    let mut last_watchdog = Instant::now();
     let recovery_interval = Duration::from_secs(300);
     let disk_interval = Duration::from_secs(6 * 3600);
+    let watchdog_interval = effect::systemd::watchdog_interval().unwrap_or(Duration::from_secs(10));
     let startup_delay = Duration::from_secs(120);
     let start_instant = Instant::now();
 
@@ -115,20 +128,25 @@ pub fn run_control_loop(
                 );
 
                 if state.shutting_down {
-                    eprintln!("[cratond] shutdown initiated");
+                    crate::log::info("runtime", "shutdown initiated");
                     sd_notify.stopping();
                     break;
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                eprintln!("[cratond] event channel disconnected — shutting down");
+                crate::log::warn("runtime", "event channel disconnected, shutting down");
                 break;
             }
         }
+
+        if should_send_watchdog(state.shutting_down, last_watchdog.elapsed(), watchdog_interval) {
+            sd_notify.watchdog();
+            last_watchdog = Instant::now();
+        }
     }
 
-    eprintln!("[cratond] control loop exiting");
+    crate::log::info("runtime", "control loop exiting");
     sd_notify.status("shutting down");
     publish_snapshot(&state, &snapshot, &outbox_overflow);
 }
@@ -191,7 +209,7 @@ fn execute_commands(
                 sd_notify.watchdog();
             }
             Command::Shutdown { grace_secs } => {
-                eprintln!("[cratond] shutdown command, grace={grace_secs}s");
+                crate::log::info("runtime", &format!("shutdown command received, grace={grace_secs}s"));
                 state.shutting_down = true;
             }
             Command::ResticUnlock => {
@@ -201,9 +219,9 @@ fn execute_commands(
                 exec_update_llm_context(state, config);
             }
             Command::WriteIncident(report) => {
-                eprintln!(
-                    "[cratond] incident: {:?} service={:?}",
-                    report.kind, report.service
+                crate::log::warn(
+                    "incident",
+                    &format!("incident queued: {:?} service={:?}", report.kind, report.service),
                 );
                 let report = report.clone();
                 std::thread::Builder::new()
@@ -214,9 +232,7 @@ fn execute_commands(
             Command::CheckDiskUsage => {
                 let mono = monotonic_secs();
                 if let Some(sample) = effect::disk::get_usage("/", mono) {
-                    state.disk_usage_percent = Some(sample.usage_percent);
-                    state.disk_free_bytes = Some(sample.free_bytes);
-                    state.disk_samples.push(sample);
+                    let _ = event_tx.send(Event::DiskSample(sample));
                 }
             }
             Command::RunDiskCleanup { level } => {
@@ -657,6 +673,14 @@ fn make_ctx() -> Ctx {
     }
 }
 
+fn should_send_watchdog(
+    shutting_down: bool,
+    elapsed: Duration,
+    watchdog_interval: Duration,
+) -> bool {
+    !shutting_down && elapsed >= watchdog_interval
+}
+
 fn epoch_secs_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -682,5 +706,38 @@ fn monotonic_secs() -> u64 {
         static START: OnceLock<Instant> = OnceLock::new();
         let start = START.get_or_init(Instant::now);
         start.elapsed().as_secs()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn watchdog_sends_when_interval_elapsed() {
+        assert!(should_send_watchdog(
+            false,
+            Duration::from_secs(10),
+            Duration::from_secs(10)
+        ));
+        assert!(should_send_watchdog(
+            false,
+            Duration::from_secs(11),
+            Duration::from_secs(10)
+        ));
+    }
+
+    #[test]
+    fn watchdog_does_not_send_before_interval_or_during_shutdown() {
+        assert!(!should_send_watchdog(
+            false,
+            Duration::from_secs(9),
+            Duration::from_secs(10)
+        ));
+        assert!(!should_send_watchdog(
+            true,
+            Duration::from_secs(10),
+            Duration::from_secs(10)
+        ));
     }
 }

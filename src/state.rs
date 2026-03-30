@@ -164,6 +164,18 @@ impl ServiceStatus {
     pub fn is_healthy(&self) -> bool {
         matches!(self, Self::Healthy { .. })
     }
+
+    #[must_use]
+    pub fn is_degraded(&self) -> bool {
+        matches!(
+            self,
+            Self::Unhealthy { .. }
+                | Self::Recovering { .. }
+                | Self::Failed { .. }
+                | Self::BlockedByDep { .. }
+                | Self::Suppressed { .. }
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

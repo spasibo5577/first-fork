@@ -37,14 +37,14 @@ pub fn write_report(report: &IncidentReport) {
 
     let dir = Path::new(INCIDENT_DIR);
     if let Err(e) = std::fs::create_dir_all(dir) {
-        eprintln!("[cratond] cannot create incident dir: {e}");
+        crate::log::error("incident", &format!("cannot create incident dir: {e}"));
         return;
     }
 
     let path = dir.join(&filename);
     if let Err(e) = crate::persist::atomic_write(&path, content.as_bytes()) {
-        eprintln!("[cratond] failed to write incident {filename}: {e}");
+        crate::log::error("incident", &format!("failed to write incident {filename}: {e}"));
     } else {
-        eprintln!("[cratond] incident written: {filename}");
+        crate::log::info("incident", &format!("incident written: {filename}"));
     }
 }

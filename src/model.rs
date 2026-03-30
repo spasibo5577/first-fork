@@ -345,6 +345,9 @@ pub enum Event {
     /// Health probes completed.
     ProbeResults(Vec<ProbeResult>),
 
+    /// Fresh disk usage sample collected by runtime and fed back into reducer.
+    DiskSample(crate::state::DiskSample),
+
     /// An effect (external command) completed.
     /// Constructed by effect executor, fed back into reducer.
     #[allow(dead_code)] // Phase 4: effect loop closure

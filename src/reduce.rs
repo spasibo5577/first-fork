@@ -39,15 +39,14 @@ pub fn reduce(
     match event {
         Event::Tick { due_tasks } => handle_tick(state, &due_tasks, config, ctx),
         Event::ProbeResults(results) => handle_probes(state, &results, config, graph, ctx),
+        Event::DiskSample(sample) => handle_disk_sample(state, sample, config),
         Event::EffectCompleted { cmd_id, result } => {
             handle_effect_completed(state, cmd_id, &result, config, ctx)
         }
         Event::HttpCommand(req) => handle_http_command(state, req, config, ctx),
         Event::Signal(SignalKind::Shutdown) => handle_shutdown(state),
         Event::Signal(SignalKind::Reload) => vec![],
-        Event::StartupRecovery { persisted_backup } => {
-            handle_startup_recovery(state, &persisted_backup)
-        }
+        Event::StartupRecovery { persisted_backup } => handle_startup_recovery(state, &persisted_backup, ctx),
     }
 }
 
@@ -81,7 +80,6 @@ fn handle_tick(
             TaskKind::DiskMonitor => {
                 state.last_disk_mono = Some(ctx.mono_secs);
                 cmds.push(Command::CheckDiskUsage);
-                cmds.extend(evaluate_disk(state, config));
             }
             TaskKind::AptUpdates => {
                 state.last_apt_day = Some(ctx.wall.day);
@@ -160,7 +158,7 @@ fn apply_decisions(
 
         match decision {
             recovery::Decision::Healthy => {
-                if !svc.status.is_healthy() {
+                if svc.status.is_degraded() {
                     recovered.push(sid.clone());
                 }
                 svc.status = ServiceStatus::Healthy {
@@ -439,6 +437,13 @@ fn handle_backup_failure(
 ) -> Vec<Command> {
     state.consecutive_backup_failures += 1;
     let error = effect_error_message(result);
+    crate::log::warn(
+        "backup",
+        &format!(
+            "backup failed: {}; consecutive_failures={}",
+            error, state.consecutive_backup_failures
+        ),
+    );
 
     let mut cmds = Vec::new();
 
@@ -485,14 +490,14 @@ fn finalize_backup(
 
     let alert = if success {
         Alert {
-            title: "✅ Backup завершён".into(),
+            title: "✅ Резервное копирование завершено".into(),
             body: "Резервное копирование выполнено успешно".into(),
             priority: AlertPriority::Default,
             tags: "white_check_mark".into(),
         }
     } else {
         Alert {
-            title: "❌ Backup не удался".into(),
+            title: "❌ Резервное копирование не удалось".into(),
             body: format!(
                 "Ошибка: {}\nПодряд неудач: {}",
                 error.as_deref().unwrap_or("unknown"),
@@ -721,6 +726,17 @@ fn record_remediation(
 
 // ─── Disk evaluation ───────────────────────────────────────────
 
+fn handle_disk_sample(
+    state: &mut State,
+    sample: crate::state::DiskSample,
+    config: &CratonConfig,
+) -> Vec<Command> {
+    state.disk_usage_percent = Some(sample.usage_percent);
+    state.disk_free_bytes = Some(sample.free_bytes);
+    state.disk_samples.push(sample);
+    evaluate_disk(state, config)
+}
+
 fn evaluate_disk(state: &State, config: &CratonConfig) -> Vec<Command> {
     let Some(usage) = state.disk_usage_percent else {
         return vec![];
@@ -803,14 +819,14 @@ fn build_daily_summary(state: &State, config: &CratonConfig) -> Vec<Command> {
     let last_backup = state.backup_history.iter().last();
     match last_backup {
         Some(b) if b.success => {
-            let _ = writeln!(body, "\n📦 Последний backup: ✅ успешно");
+            let _ = writeln!(body, "\n📦 Последнее резервное копирование: ✅ успешно");
         }
         Some(b) => {
             let err = b.error.as_deref().unwrap_or("unknown");
-            let _ = writeln!(body, "\n📦 Последний backup: ❌ {err}");
+            let _ = writeln!(body, "\n📦 Последнее резервное копирование: ❌ {err}");
         }
         None => {
-            let _ = writeln!(body, "\n📦 Backup: нет данных");
+            let _ = writeln!(body, "\n📦 Резервное копирование: нет данных");
         }
     }
 
@@ -834,7 +850,7 @@ fn handle_shutdown(state: &mut State) -> Vec<Command> {
 
 // ─── Startup recovery ──────────────────────────────────────────
 
-fn handle_startup_recovery(state: &mut State, persisted: &BackupPhase) -> Vec<Command> {
+fn handle_startup_recovery(state: &mut State, persisted: &BackupPhase, ctx: &Ctx) -> Vec<Command> {
     let actions = backup::crash_compensation(persisted);
     let mut cmds = Vec::new();
 
@@ -846,11 +862,16 @@ fn handle_startup_recovery(state: &mut State, persisted: &BackupPhase) -> Vec<Co
             backup::CompensationAction::StartService { id, unit } => {
                 cmds.push(Command::StartService { id, unit });
             }
-            backup::CompensationAction::StartServiceByName { name } => {
-                cmds.push(Command::StartService {
-                    id: ServiceId(name.clone()),
-                    unit: format!("{name}.service"),
-                });
+            backup::CompensationAction::ReportInvariantViolation { message } => {
+                cmds.push(Command::WriteIncident(IncidentReport {
+                    kind: IncidentKind::BackupFailed,
+                    service: None,
+                    timestamp_epoch_secs: ctx.epoch_secs,
+                    details: BTreeMap::from([
+                        ("error".into(), message),
+                        ("phase".into(), format!("{persisted:?}")),
+                    ]),
+                }));
             }
             backup::CompensationAction::ResetToIdle => {
                 state.backup_phase = BackupPhase::Idle;
@@ -861,8 +882,8 @@ fn handle_startup_recovery(state: &mut State, persisted: &BackupPhase) -> Vec<Co
 
     if !cmds.is_empty() {
         cmds.push(Command::SendAlert(Alert {
-            title: "⚠️ Crash recovery выполнен".into(),
-            body: format!("Backup был прерван в фазе: {persisted:?}"),
+            title: "⚠️ Выполнено восстановление после сбоя".into(),
+            body: format!("Резервное копирование было прервано в фазе: {persisted:?}"),
             priority: AlertPriority::High,
             tags: "warning".into(),
         }));
@@ -879,6 +900,15 @@ mod tests {
     use super::*;
     use crate::config::CratonConfig;
     use crate::model::{ProbeError, ProbeResult};
+
+    fn failed_effect(stderr: &str) -> EffectResult {
+        EffectResult::Failed {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: stderr.to_string(),
+            duration_ms: 100,
+        }
+    }
 
     fn test_config() -> CratonConfig {
         let toml = r#"
@@ -985,6 +1015,33 @@ url = "http://localhost:8080/v1/health"
     }
 
     #[test]
+    fn unknown_to_healthy_is_not_counted_as_recovery() {
+        let config = test_config();
+        let graph = DepGraph::build(&config.services).unwrap();
+        let mut state = State::new(&config, 0);
+        let ctx = test_ctx(300);
+
+        let cmds = reduce(
+            &mut state,
+            Event::ProbeResults(vec![ProbeResult::Healthy {
+                service: ServiceId("ntfy".into()),
+                latency_ms: 3,
+            }]),
+            &config,
+            &graph,
+            &ctx,
+        );
+
+        let history = state.recovery_history.to_vec();
+        let last = history.last().expect("recovery history entry");
+        assert!(last.recovered.is_empty(), "Unknown -> Healthy must not count as recovery");
+        assert!(!cmds.iter().any(|c| matches!(
+            c,
+            Command::SendAlert(a) if a.title.contains("Восстановлены")
+        )));
+    }
+
+    #[test]
     fn probe_unhealthy_emits_restart() {
         let config = test_config();
         let graph = DepGraph::build(&config.services).unwrap();
@@ -1067,6 +1124,163 @@ url = "http://localhost:8080/v1/health"
             |c| matches!(c, Command::StartService { id, .. } if id.as_str() == "continuwuity")
         ));
         assert!(cmds.iter().any(|c| matches!(c, Command::SendAlert(_))));
+    }
+
+    #[test]
+    fn backup_retention_failure_uses_failure_path() {
+        let config = test_config();
+        let mut state = State::new(&config, 0);
+        state.backup_phase = BackupPhase::RetentionRunning {
+            run_id: "r1".into(),
+        };
+        let ctx = test_ctx(600);
+
+        let cmds = handle_backup_effect(&mut state, &failed_effect("forget failed"), &config, &ctx);
+
+        assert!(state.backup_phase.is_idle());
+        assert_eq!(state.consecutive_backup_failures, 1);
+        let last = state.backup_history.to_vec().pop().expect("backup history entry");
+        assert!(!last.success);
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            Command::ReleaseLease {
+                resource: ResourceId::BackupRepo
+            }
+        )));
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            Command::SendAlert(a) if a.title.contains("Резервное копирование не удалось")
+        )));
+    }
+
+    #[test]
+    fn backup_verifying_failure_finalizes_backup() {
+        let config = test_config();
+        let mut state = State::new(&config, 0);
+        state.backup_phase = BackupPhase::Verifying {
+            run_id: "r1".into(),
+        };
+        let ctx = test_ctx(700);
+
+        let cmds = handle_backup_effect(&mut state, &failed_effect("check failed"), &config, &ctx);
+
+        assert!(state.backup_phase.is_idle());
+        let last = state.backup_history.to_vec().pop().expect("backup history entry");
+        assert!(!last.success);
+        assert_eq!(last.error.as_deref(), Some("exit 1: check failed"));
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            Command::PersistBackupState(BackupPhase::Idle)
+        )));
+    }
+
+    #[test]
+    fn backup_restic_success_advances_to_retention_running() {
+        let config = test_config();
+        let mut state = State::new(&config, 0);
+        state.backup_phase = BackupPhase::ResticRunning {
+            run_id: "r1".into(),
+            pre_backup_state: vec![crate::model::ServiceSnapshot {
+                id: ServiceId("ntfy".into()),
+                was_running: true,
+                unit: "ntfy.service".into(),
+            }],
+        };
+        state.consecutive_backup_failures = 2;
+        let ctx = test_ctx(800);
+
+        let cmds = handle_backup_effect(
+            &mut state,
+            &EffectResult::Success {
+                stdout: String::new(),
+                stderr: String::new(),
+                duration_ms: 100,
+            },
+            &config,
+            &ctx,
+        );
+
+        assert!(matches!(state.backup_phase, BackupPhase::RetentionRunning { .. }));
+        assert_eq!(state.consecutive_backup_failures, 0);
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            Command::StartService { id, .. } if id.as_str() == "ntfy"
+        )));
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            Command::ReleaseLease {
+                resource: ResourceId::Service(id)
+            } if id.as_str() == "ntfy"
+        )));
+        assert!(cmds.iter().any(|c| matches!(c, Command::ResticForget { .. })));
+    }
+
+    #[test]
+    fn backup_failures_escalate_after_three_consecutive_failures() {
+        let config = test_config();
+        let mut state = State::new(&config, 0);
+        state.backup_phase = BackupPhase::RetentionRunning {
+            run_id: "r1".into(),
+        };
+        state.consecutive_backup_failures = 2;
+        let ctx = test_ctx(900);
+
+        let cmds = handle_backup_effect(&mut state, &failed_effect("still failing"), &config, &ctx);
+
+        assert_eq!(state.consecutive_backup_failures, 3);
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            Command::WriteIncident(r) if r.kind == IncidentKind::BackupFailed
+        )));
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            Command::SendAlert(a) if a.title.contains("Резервное копирование не удалось")
+        )));
+    }
+
+    #[test]
+    fn disk_sample_result_triggers_alerts_on_fresh_sample_immediately() {
+        let config = test_config();
+        let graph = DepGraph::build(&config.services).unwrap();
+        let mut state = State::new(&config, 0);
+        let ctx = test_ctx(1000);
+
+        let tick_cmds = reduce(
+            &mut state,
+            Event::Tick {
+                due_tasks: vec![TaskKind::DiskMonitor],
+            },
+            &config,
+            &graph,
+            &ctx,
+        );
+        assert!(tick_cmds.iter().any(|c| matches!(c, Command::CheckDiskUsage)));
+        assert!(
+            !tick_cmds
+                .iter()
+                .any(|c| matches!(c, Command::RunDiskCleanup { .. } | Command::SendAlert(_))),
+            "disk decisions must wait for fresh sample event"
+        );
+
+        let sample_cmds = reduce(
+            &mut state,
+            Event::DiskSample(crate::state::DiskSample {
+                mono: ctx.mono_secs,
+                usage_percent: 95,
+                free_bytes: 1_000_000,
+            }),
+            &config,
+            &graph,
+            &ctx,
+        );
+
+        assert!(sample_cmds
+            .iter()
+            .any(|c| matches!(c, Command::RunDiskCleanup { level: crate::model::CleanupLevel::Aggressive })));
+        assert!(sample_cmds.iter().any(|c| matches!(
+            c,
+            Command::SendAlert(a) if a.title.contains("Диск критически заполнен")
+        )));
     }
 
     #[test]

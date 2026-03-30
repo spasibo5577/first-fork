@@ -48,9 +48,10 @@ pub fn crash_compensation(phase: &BackupPhase) -> Vec<CompensationAction> {
                 }
             }
         } else {
-            // Defensive: phase needs recovery but no snapshot data.
-            actions.push(CompensationAction::StartServiceByName {
-                name: "continuwuity".to_string(),
+            actions.push(CompensationAction::ReportInvariantViolation {
+                message: format!(
+                    "backup crash recovery lost pre_backup_state for phase {phase:?}"
+                ),
             });
         }
     }
@@ -64,8 +65,7 @@ pub fn crash_compensation(phase: &BackupPhase) -> Vec<CompensationAction> {
 pub enum CompensationAction {
     ResticUnlock,
     StartService { id: ServiceId, unit: String },
-    /// Fallback when pre-backup snapshot data is unavailable.
-    StartServiceByName { name: String },
+    ReportInvariantViolation { message: String },
     ResetToIdle,
 }
 
@@ -220,6 +220,25 @@ mod tests {
             run_id: "r1".into(),
         };
         let actions = crash_compensation(&phase);
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, CompensationAction::StartService { .. })));
+        assert!(actions.contains(&CompensationAction::ResetToIdle));
+    }
+
+    #[test]
+    fn crash_without_pre_backup_state_reports_invariant_violation() {
+        let phase = BackupPhase::ServicesStarting {
+            run_id: "r1".into(),
+            remaining: vec![],
+        };
+
+        let actions = crash_compensation(&phase);
+
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            CompensationAction::ReportInvariantViolation { .. }
+        )));
         assert!(!actions
             .iter()
             .any(|a| matches!(a, CompensationAction::StartService { .. })));

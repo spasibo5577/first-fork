@@ -54,9 +54,9 @@ impl NotifySender {
         if let Err(mpsc::TrySendError::Full(dropped) | mpsc::TrySendError::Disconnected(dropped)) =
             self.tx.try_send(alert)
         {
-            eprintln!(
-                "[cratond] ALERT DROPPED (queue full): {} | {}",
-                dropped.title, dropped.body
+            crate::log::warn(
+                "notify",
+                &format!("alert dropped (queue full): {} | {}", dropped.title, dropped.body),
             );
         }
     }
@@ -90,10 +90,7 @@ impl NotifyConsumer {
         let mut failed_count: u64 = 0;
         let mut dedup_count: u64 = 0;
 
-        eprintln!(
-            "[cratond] notifier started, url={}, outbox={}",
-            self.config.ntfy_url, self.config.outbox_path
-        );
+        crate::log::info("notify", "notifier started");
 
         // ── Startup replay ────────────────────────────────────
         let undelivered: Vec<OutboxEntry> = outbox
@@ -104,9 +101,9 @@ impl NotifyConsumer {
             .collect();
 
         if !undelivered.is_empty() {
-            eprintln!(
-                "[cratond] replaying {} undelivered alert(s) from outbox",
-                undelivered.len()
+            crate::log::info(
+                "notify",
+                &format!("replaying {} undelivered alert(s) from outbox", undelivered.len()),
             );
         }
 
@@ -131,9 +128,9 @@ impl NotifyConsumer {
                 sent_count += 1;
             } else {
                 failed_count += 1;
-                eprintln!(
-                    "[cratond] replay: NTFY unreachable for '{}', will retry next start",
-                    entry.alert.title
+                crate::log::warn(
+                    "notify",
+                    &format!("replay delivery failed for '{}', will retry next start", entry.alert.title),
                 );
             }
         }
@@ -184,9 +181,9 @@ impl NotifyConsumer {
                         break;
                     }
                     Err(e) => {
-                        eprintln!(
-                            "[cratond] NTFY delivery failed (attempt {}): {e}",
-                            attempt + 1
+                        crate::log::warn(
+                            "notify",
+                            &format!("NTFY delivery failed (attempt {}): {e}", attempt + 1),
                         );
                     }
                 }
@@ -197,11 +194,14 @@ impl NotifyConsumer {
                 outbox.persist(&outbox_path);
             } else {
                 failed_count += 1;
-                eprintln!(
-                    "[cratond] NTFY UNREACHABLE — alert: [{}] {} | {}",
-                    alert.priority.as_str(),
-                    alert.title,
-                    alert.body
+                crate::log::error(
+                    "notify",
+                    &format!(
+                        "NTFY unreachable: [{}] {} | {}",
+                        alert.priority.as_str(),
+                        alert.title,
+                        alert.body
+                    ),
                 );
             }
         }

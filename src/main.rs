@@ -16,6 +16,7 @@ mod graph;
 mod history;
 mod http;
 mod lease;
+mod log;
 mod model;
 mod notify;
 mod persist;
@@ -63,9 +64,9 @@ fn load_or_create_token(token_path: &str) -> String {
     let token = format!("{:x}", hasher.finalize());
 
     if let Err(e) = persist::atomic_write(path, token.as_bytes()) {
-        eprintln!("[cratond] warning: failed to write token to {token_path}: {e}");
+        crate::log::warn("startup", &format!("failed to persist remediation token: {e}"));
     } else {
-        eprintln!("[cratond] remediation token written to {token_path}");
+        crate::log::info("startup", "remediation token persisted");
     }
 
     token
@@ -78,10 +79,10 @@ fn main() {
 
     match run(&config_path) {
         Ok(()) => {
-            eprintln!("[cratond] stopped");
+            crate::log::info("startup", "daemon stopped");
         }
         Err(e) => {
-            eprintln!("FATAL: {e}");
+            crate::log::error("startup", &format!("fatal error: {e}"));
             std::process::exit(1);
         }
     }
@@ -94,18 +95,20 @@ fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     let cfg = config::CratonConfig::from_toml(&raw)?;
 
-    eprintln!(
-        "[cratond] config loaded — {} services, backup: {}",
-        cfg.services.len(),
-        cfg.backup.restic_repo,
+    crate::log::info(
+        "startup",
+        &format!("config loaded: {} services", cfg.services.len()),
     );
 
     // ── Phase 2: Build dependency graph ──
     let dep_graph = graph::DepGraph::build(&cfg.services)?;
-    eprintln!(
-        "[cratond] dependency graph: {} nodes, order: {:?}",
-        dep_graph.all_services().len(),
-        dep_graph.topological_order()
+    crate::log::info(
+        "startup",
+        &format!(
+            "dependency graph built: {} nodes, {} ordered",
+            dep_graph.all_services().len(),
+            dep_graph.topological_order().len()
+        ),
     );
 
     // ── Phase 3: Create directories ──
@@ -113,7 +116,7 @@ fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
         let path = std::path::Path::new(dir);
         if !path.exists() {
             if let Err(e) = std::fs::create_dir_all(path) {
-                eprintln!("[cratond] warning: cannot create {dir}: {e}");
+                crate::log::warn("startup", &format!("cannot create {dir}: {e}"));
             }
         }
     }
@@ -179,14 +182,16 @@ fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Phase 5: Run control loop (blocks until shutdown) ──
     runtime::run_control_loop(
-        &cfg,
-        &dep_graph,
+        runtime::RuntimeDeps {
+            config: &cfg,
+            graph: &dep_graph,
+            snapshot,
+            notifier: notif_sender,
+            sd_notify: &sd,
+            outbox_overflow,
+        },
         event_rx,
         event_tx,
-        snapshot,
-        notif_sender,
-        &sd,
-        outbox_overflow,
     );
 
     Ok(())
