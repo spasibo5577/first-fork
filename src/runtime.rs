@@ -16,6 +16,7 @@ use crate::notify::NotifySender;
 use crate::reduce::{self, Ctx};
 use crate::schedule::{self, Schedule, WallClock};
 use crate::state::State;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
@@ -29,8 +30,17 @@ pub struct RuntimeDeps<'a> {
     pub outbox_overflow: Arc<AtomicBool>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupKind {
+    FirstStart,
+    DaemonRestart,
+    HostBoot,
+    Unknown,
+}
+
 /// Runs the main control loop. Blocks until shutdown.
 #[allow(clippy::needless_pass_by_value)] // Arc/Sender/NotifySender are moved into this thread
+#[allow(clippy::too_many_lines)] // Central loop intentionally stays explicit until a larger runtime refactor is warranted.
 pub fn run_control_loop(
     deps: RuntimeDeps<'_>,
     event_rx: mpsc::Receiver<Event>,
@@ -46,6 +56,10 @@ pub fn run_control_loop(
     } = deps;
     let mono_start = monotonic_secs();
     let mut state = State::new(config, mono_start);
+    let startup_kind = detect_startup_kind(
+        Path::new("/proc/sys/kernel/random/boot_id"),
+        Path::new("/var/lib/craton/last-boot-id"),
+    );
 
     // Load persisted maintenance entries (drop expired ones).
     load_persisted_maintenance(&mut state, mono_start);
@@ -70,14 +84,7 @@ pub fn run_control_loop(
     // Signal ready.
     sd_notify.ready();
     sd_notify.status("running");
-    crate::log::info("runtime", "control loop started");
-
-    notifier.queue(Alert {
-        title: "🟢 Кратон запущен".into(),
-        body: format!("Сервисов под наблюдением: {}", config.services.len()),
-        priority: AlertPriority::Default,
-        tags: "white_check_mark".into(),
-    });
+    emit_startup_signal(startup_kind, config.services.len(), &notifier);
 
     // Schedule state.
     let mut last_recovery = Instant::now();
@@ -572,6 +579,82 @@ fn load_persisted_backup_phase() -> BackupPhase {
     }
 }
 
+fn detect_startup_kind(current_boot_path: &Path, persisted_boot_path: &Path) -> StartupKind {
+    let current_boot_id = match read_trimmed_file(current_boot_path) {
+        Ok(Some(value)) => value,
+        Ok(None) => {
+            crate::log::warn("startup", "boot id file is empty");
+            return StartupKind::Unknown;
+        }
+        Err(e) => {
+            crate::log::warn("startup", &format!("failed to read boot id: {e}"));
+            return StartupKind::Unknown;
+        }
+    };
+
+    let previous_boot_id = match crate::persist::read_optional(persisted_boot_path) {
+        Ok(Some(data)) => String::from_utf8(data)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        Ok(None) => None,
+        Err(e) => {
+            crate::log::warn("startup", &format!("failed to read last boot id: {e}"));
+            None
+        }
+    };
+
+    let kind = classify_startup_kind(Some(current_boot_id.as_str()), previous_boot_id.as_deref());
+
+    if let Err(e) = crate::persist::atomic_write(persisted_boot_path, current_boot_id.as_bytes()) {
+        crate::log::warn("startup", &format!("failed to persist last boot id: {e}"));
+    } else {
+        crate::log::info(
+            "startup",
+            &format!("boot session recorded ({})", kind.label()),
+        );
+    }
+
+    kind
+}
+
+fn emit_startup_signal(startup_kind: StartupKind, service_count: usize, notifier: &NotifySender) {
+    crate::log::info(
+        "runtime",
+        &format!("control loop started ({})", startup_kind.label()),
+    );
+
+    notifier.queue(Alert {
+        title: startup_kind.alert_title().into(),
+        body: format!(
+            "{}\nСервисов под наблюдением: {}",
+            startup_kind.alert_body(),
+            service_count
+        ),
+        priority: AlertPriority::Default,
+        tags: "white_check_mark".into(),
+    });
+}
+
+fn read_trimmed_file(path: &Path) -> Result<Option<String>, std::io::Error> {
+    let content = std::fs::read_to_string(path)?;
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(trimmed.to_string()))
+    }
+}
+
+fn classify_startup_kind(current_boot_id: Option<&str>, previous_boot_id: Option<&str>) -> StartupKind {
+    match (current_boot_id, previous_boot_id) {
+        (None, _) => StartupKind::Unknown,
+        (Some(_), None) => StartupKind::FirstStart,
+        (Some(current), Some(previous)) if current == previous => StartupKind::DaemonRestart,
+        (Some(_), Some(_)) => StartupKind::HostBoot,
+    }
+}
+
 // ─── Effect helpers ────────────────────────────────────────────
 
 fn exec_to_effect_result(
@@ -681,6 +764,34 @@ fn should_send_watchdog(
     !shutting_down && elapsed >= watchdog_interval
 }
 
+impl StartupKind {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::FirstStart => "first_start",
+            Self::DaemonRestart => "daemon_restart",
+            Self::HostBoot => "host_boot",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    const fn alert_title(self) -> &'static str {
+        match self {
+            Self::FirstStart | Self::Unknown => "🟢 Кратон запущен",
+            Self::DaemonRestart => "🟢 Кратон перезапущен",
+            Self::HostBoot => "🟢 Кратон запущен после загрузки хоста",
+        }
+    }
+
+    const fn alert_body(self) -> &'static str {
+        match self {
+            Self::FirstStart => "Первый запуск или отсутствует сохранённый boot id.",
+            Self::DaemonRestart => "Перезапуск демона в рамках текущей загрузки хоста.",
+            Self::HostBoot => "Обнаружена новая загрузка хоста.",
+            Self::Unknown => "Не удалось надёжно определить тип запуска.",
+        }
+    }
+}
+
 fn epoch_secs_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -712,6 +823,7 @@ fn monotonic_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn watchdog_sends_when_interval_elapsed() {
@@ -739,5 +851,49 @@ mod tests {
             Duration::from_secs(10),
             Duration::from_secs(10)
         ));
+    }
+
+    #[test]
+    fn classify_startup_kind_distinguishes_first_restart_and_new_boot() {
+        assert_eq!(classify_startup_kind(Some("boot-a"), None), StartupKind::FirstStart);
+        assert_eq!(
+            classify_startup_kind(Some("boot-a"), Some("boot-a")),
+            StartupKind::DaemonRestart
+        );
+        assert_eq!(
+            classify_startup_kind(Some("boot-b"), Some("boot-a")),
+            StartupKind::HostBoot
+        );
+    }
+
+    #[test]
+    fn detect_startup_kind_persists_current_boot_id() {
+        let dir = std::env::temp_dir().join(format!(
+            "craton_runtime_boot_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("create test dir: {e}"));
+
+        let current_path = dir.join("boot_id");
+        let persisted_path = dir.join("last_boot_id");
+        fs::write(&current_path, "boot-1\n").unwrap_or_else(|e| panic!("write current boot: {e}"));
+
+        let first = detect_startup_kind(&current_path, &persisted_path);
+        assert_eq!(first, StartupKind::FirstStart);
+        assert_eq!(
+            fs::read_to_string(&persisted_path)
+                .unwrap_or_else(|e| panic!("read persisted boot id: {e}")),
+            "boot-1"
+        );
+
+        let second = detect_startup_kind(&current_path, &persisted_path);
+        assert_eq!(second, StartupKind::DaemonRestart);
+
+        fs::write(&current_path, "boot-2\n").unwrap_or_else(|e| panic!("rewrite current boot: {e}"));
+        let third = detect_startup_kind(&current_path, &persisted_path);
+        assert_eq!(third, StartupKind::HostBoot);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

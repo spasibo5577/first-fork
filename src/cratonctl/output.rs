@@ -316,6 +316,18 @@ pub fn render_doctor(report: &DoctorReport, presentation: Presentation) -> Strin
             paint_warn("no", presentation)
         }
     ));
+    let advice = doctor_advice(report);
+    if !advice.is_empty() {
+        out.push(format!(
+            "{}\n{}",
+            paint_section("advice:", presentation),
+            advice
+                .into_iter()
+                .map(|line| format!("  - {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
     out.join("\n\n")
 }
 
@@ -418,6 +430,56 @@ fn render_empty_or_lines(lines: &str) -> String {
     } else {
         lines.into()
     }
+}
+
+fn doctor_advice(report: &DoctorReport) -> Vec<String> {
+    let mut advice = Vec::new();
+    if report
+        .checks
+        .iter()
+        .any(|check| check.code == "daemon_url_unreachable")
+    {
+        advice.push("check whether cratond is running and whether --url points to the right daemon".into());
+    }
+    if report
+        .checks
+        .iter()
+        .any(|check| check.code == "health_unavailable")
+    {
+        advice.push("the daemon is reachable but reports itself unavailable; inspect status and daemon logs".into());
+    }
+    if report
+        .checks
+        .iter()
+        .any(|check| check.code == "token_not_provided")
+    {
+        advice.push("mutating commands need --token, CRATONCTL_TOKEN, or a readable token file".into());
+    }
+    if report
+        .checks
+        .iter()
+        .any(|check| check.code == "token_file_missing")
+    {
+        advice.push("pass --token-file explicitly or install the remediation token at /var/lib/craton/remediation-token".into());
+    }
+    if report
+        .checks
+        .iter()
+        .any(|check| check.code == "token_file_unreadable")
+    {
+        advice.push("fix token file permissions or run as a user that can read the token file".into());
+    }
+    if report
+        .checks
+        .iter()
+        .any(|check| check.code == "token_file_invalid")
+    {
+        advice.push("replace the token file with a single non-empty token line".into());
+    }
+    if advice.is_empty() && report.read_only_ready && report.mutating_ready {
+        advice.push("no obvious operator-facing issues detected".into());
+    }
+    advice
 }
 
 fn paint_status(status: &str, presentation: Presentation) -> String {
@@ -562,5 +624,33 @@ mod tests {
         );
         let lines = rendered.lines().collect::<Vec<_>>();
         assert_eq!(lines[2].find('|'), lines[3].find('|'));
+    }
+
+    #[test]
+    fn doctor_renderer_includes_actionable_advice() {
+        let report = DoctorReport {
+            url: "http://127.0.0.1:18800".into(),
+            checks: vec![
+                crate::cratonctl::dto::DoctorCheck {
+                    name: "daemon URL".into(),
+                    status: "fail".into(),
+                    code: "daemon_url_unreachable".into(),
+                    detail: "connect failed".into(),
+                },
+                crate::cratonctl::dto::DoctorCheck {
+                    name: "token access".into(),
+                    status: "warn".into(),
+                    code: "token_not_provided".into(),
+                    detail: "missing".into(),
+                },
+            ],
+            read_only_ready: false,
+            mutating_ready: false,
+        };
+
+        let rendered = render_doctor(&report, PLAIN);
+        assert!(rendered.contains("advice:"));
+        assert!(rendered.contains("check whether cratond is running"));
+        assert!(rendered.contains("mutating commands need --token"));
     }
 }
