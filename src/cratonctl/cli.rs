@@ -161,17 +161,26 @@ enum RawCommand {
     Status,
     #[command(about = "List services and current state")]
     Services,
-    #[command(about = "Show one service")]
+    #[command(
+        about = "Show one service",
+        after_help = SERVICE_HELP
+    )]
     Service {
         #[arg(value_name = "id")]
         id: String,
     },
-    #[command(about = "Show historical events")]
+    #[command(
+        about = "Show historical events",
+        after_help = HISTORY_HELP
+    )]
     History {
         #[arg(value_enum, value_name = "kind")]
         kind: RawHistoryKind,
     },
-    #[command(about = "Collect daemon-side diagnostics for one service")]
+    #[command(
+        about = "Collect daemon-side diagnostics for one service",
+        after_help = DIAGNOSE_HELP
+    )]
     Diagnose {
         #[arg(value_name = "service")]
         service: String,
@@ -191,11 +200,14 @@ enum RawCommand {
         #[arg(
             value_name = "task",
             help = "Task name accepted by the daemon",
-            long_help = "Task name accepted by the daemon. Common examples are recovery and backup; the daemon validates the final value."
+            long_help = "Task name accepted by the daemon. Common examples are recovery, backup, disk-monitor, apt-updates, docker-updates, and daily-summary; the daemon validates the final value."
         )]
         task: String,
     },
-    #[command(about = "Request a service restart through daemon policy")]
+    #[command(
+        about = "Request a service restart through daemon policy",
+        after_help = RESTART_HELP
+    )]
     Restart {
         #[arg(value_name = "service")]
         service: String,
@@ -376,7 +388,11 @@ fn map_command(command: RawCommand) -> Result<Command, CratonctlError> {
 
 const EXTRA_HELP: &str = "Read-only commands:\n  health\n  status\n  services\n  service <id>\n  history <recovery|backup|remediation>\n  diagnose <service>\n  doctor\n\nMutating commands:\n  trigger <task>\n  restart <service>\n  docker restart <container>\n  maintenance set <service> --reason <text>\n  maintenance clear <service>\n  breaker clear <service>\n  flapping clear <service>\n  backup run\n  backup unlock\n  disk cleanup\n\nAuth behavior:\n  Read-only commands do not require a token.\n  Mutating commands resolve token in this order:\n    1. --token\n    2. CRATONCTL_TOKEN\n    3. --token-file\n    4. /var/lib/craton/remediation-token\n\nExamples:\n  cratonctl status\n  cratonctl services\n  cratonctl service ntfy\n  cratonctl doctor\n  cratonctl restart ntfy --token-file /var/lib/craton/remediation-token\n  cratonctl maintenance set ntfy --reason \"manual work\"\n  cratonctl backup run --json --token \"$CRATONCTL_TOKEN\"";
 
-const TRIGGER_HELP: &str = "Common task names:\n  recovery\n  backup\n\nExamples:\n  cratonctl trigger recovery\n  cratonctl trigger backup\n\nNotes:\n  This command uses the daemon trigger path without requiring remediation auth.\n  The daemon remains the source of truth for accepted task names.";
+const SERVICE_HELP: &str = "Examples:\n  cratonctl service ntfy\n  cratonctl service api --json\n\nNotes:\n  This command reads the current daemon snapshot.\n  It shows a focused service view rather than a full state dump.";
+const HISTORY_HELP: &str = "Kinds:\n  recovery\n  backup\n  remediation\n\nExamples:\n  cratonctl history recovery\n  cratonctl history backup --json\n  cratonctl history remediation\n\nNotes:\n  This command reads daemon history endpoints directly.\n  Use --json for machine-readable postprocessing.";
+const DIAGNOSE_HELP: &str = "Examples:\n  cratonctl diagnose ntfy\n  cratonctl diagnose api --json\n\nNotes:\n  This command asks the daemon for systemd-side diagnostics.\n  It is read-only and may include recent journal excerpts.";
+const TRIGGER_HELP: &str = "Common task names:\n  recovery\n  backup\n  disk-monitor\n  apt-updates\n  docker-updates\n  daily-summary\n\nExamples:\n  cratonctl trigger recovery\n  cratonctl trigger backup\n  cratonctl trigger daily-summary\n\nNotes:\n  This command uses the daemon trigger path without requiring remediation auth.\n  The daemon remains the source of truth for accepted task names.";
+const RESTART_HELP: &str = "Examples:\n  cratonctl restart ntfy --token-file /var/lib/craton/remediation-token\n  cratonctl restart api --json --token \"$CRATONCTL_TOKEN\"\n\nNotes:\n  This command requires mutating auth.\n  The daemon applies restart policy and records remediation history.";
 
 const MAINTENANCE_HELP: &str = "Examples:\n  cratonctl maintenance set ntfy --reason \"manual investigation\"\n  cratonctl maintenance clear ntfy\n\nNotes:\n  Maintenance commands require mutating auth.\n  The CLI does not manage maintenance duration locally.";
 const MAINTENANCE_SET_HELP: &str = "Examples:\n  cratonctl maintenance set ntfy --reason \"manual investigation\"\n  cratonctl maintenance set api --reason \"planned restart\"\n\nNotes:\n  This command requires mutating auth.\n  The reason must be non-empty.";
@@ -526,6 +542,10 @@ mod tests {
         assert!(text.contains("Common task names:"));
         assert!(text.contains("recovery"));
         assert!(text.contains("backup"));
+        assert!(text.contains("disk-monitor"));
+        assert!(text.contains("apt-updates"));
+        assert!(text.contains("docker-updates"));
+        assert!(text.contains("daily-summary"));
         assert!(!text.contains("requires mutating auth"));
     }
 
@@ -572,6 +592,52 @@ mod tests {
         assert!(!top_level);
         assert!(text.contains("requires mutating auth"));
         assert!(text.contains("DockerRestart remediation action"));
+    }
+
+    #[test]
+    fn service_help_mentions_snapshot_focus() {
+        let cli = parse_ok(&["cratonctl", "service", "--help"]);
+        let Command::Help { text, top_level } = cli.command else {
+            panic!("expected help command");
+        };
+        assert!(!top_level);
+        assert!(text.contains("cratonctl service ntfy"));
+        assert!(text.contains("focused service view"));
+    }
+
+    #[test]
+    fn history_help_mentions_all_kinds() {
+        let cli = parse_ok(&["cratonctl", "history", "--help"]);
+        let Command::Help { text, top_level } = cli.command else {
+            panic!("expected help command");
+        };
+        assert!(!top_level);
+        assert!(text.contains("recovery"));
+        assert!(text.contains("backup"));
+        assert!(text.contains("remediation"));
+        assert!(text.contains("Use --json for machine-readable postprocessing."));
+    }
+
+    #[test]
+    fn diagnose_help_mentions_read_only_diagnostics() {
+        let cli = parse_ok(&["cratonctl", "diagnose", "--help"]);
+        let Command::Help { text, top_level } = cli.command else {
+            panic!("expected help command");
+        };
+        assert!(!top_level);
+        assert!(text.contains("cratonctl diagnose ntfy"));
+        assert!(text.contains("read-only"));
+    }
+
+    #[test]
+    fn restart_help_mentions_auth_and_history() {
+        let cli = parse_ok(&["cratonctl", "restart", "--help"]);
+        let Command::Help { text, top_level } = cli.command else {
+            panic!("expected help command");
+        };
+        assert!(!top_level);
+        assert!(text.contains("requires mutating auth"));
+        assert!(text.contains("remediation history"));
     }
 
     #[test]
