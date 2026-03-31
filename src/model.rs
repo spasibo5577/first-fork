@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::sync::mpsc;
 
 // ─── Service identity ───────────────────────────────────────────
 
@@ -85,13 +85,6 @@ impl Severity {
         }
     }
 
-    /// Whether Docker daemon restart is allowed on escalation.
-    #[allow(dead_code)] // wired in Phase 4: recovery escalation gating
-    #[must_use]
-    pub const fn allows_docker_escalation(self) -> bool {
-        matches!(self, Self::Critical)
-    }
-
     /// Whether to generate an incident markdown file.
     #[must_use]
     pub const fn generates_incident(self) -> bool {
@@ -130,21 +123,6 @@ pub enum ProbeSpec {
         #[serde(default)]
         expect_stdout: Option<StdoutCheck>,
     },
-}
-
-impl ProbeSpec {
-    /// Returns the timeout for this probe as a `Duration`.
-    #[allow(dead_code)] // wired in Phase 4: probe scheduling with unified timeout
-    #[must_use]
-    pub fn timeout(&self) -> Duration {
-        let secs = match self {
-            Self::Http { timeout_secs, .. }
-            | Self::Dns { timeout_secs, .. }
-            | Self::Exec { timeout_secs, .. } => *timeout_secs,
-            Self::SystemdActive { .. } => 5,
-        };
-        Duration::from_secs(secs)
-    }
 }
 
 /// How to validate stdout of an exec probe.
@@ -350,11 +328,10 @@ pub enum Event {
 
     /// An effect (external command) completed.
     /// Constructed by effect executor, fed back into reducer.
-    #[allow(dead_code)] // Phase 4: effect loop closure
     EffectCompleted { cmd_id: u64, result: EffectResult },
 
     /// HTTP API request requiring state mutation.
-    HttpCommand(CommandRequest),
+    HttpCommand(HttpCommandRequest),
 
     /// OS signal received.
     Signal(SignalKind),
@@ -377,7 +354,7 @@ pub enum TaskKind {
 
 /// Result of executing an external command.
 /// Constructed by the effect executor and fed back via `Event::EffectCompleted`.
-#[allow(dead_code)] // Phase 4: effect worker constructs these from ExecResult
+#[expect(dead_code, reason = "effect result payload keeps full executor output for auditability")]
 #[derive(Debug, Clone)]
 pub enum EffectResult {
     Success {
@@ -402,8 +379,7 @@ pub enum EffectResult {
 
 /// Commands arriving from the HTTP API.
 /// Constructed by HTTP handler, consumed by `reduce::handle_http_command`.
-#[allow(dead_code)] // Phase 4: HTTP remediation endpoint + reducer handler
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandRequest {
     Trigger(TaskKind),
     Remediate {
@@ -414,12 +390,47 @@ pub enum CommandRequest {
     },
 }
 
+#[derive(Debug, Clone)]
+pub struct HttpCommandRequest {
+    pub command: CommandRequest,
+    pub response_tx: Option<mpsc::Sender<HttpCommandResponse>>,
+}
+
+impl HttpCommandRequest {
+    #[cfg(test)]
+    #[must_use]
+    pub const fn fire_and_forget(command: CommandRequest) -> Self {
+        Self {
+            command,
+            response_tx: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_response(
+        command: CommandRequest,
+        response_tx: mpsc::Sender<HttpCommandResponse>,
+    ) -> Self {
+        Self {
+            command,
+            response_tx: Some(response_tx),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HttpCommandResponse {
+    Accepted { detail: String },
+    Rejected { reason: String },
+    Error { error: String },
+}
+
 /// OS signals the daemon handles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignalKind {
-    #[allow(dead_code)] // constructed in signal.rs under #[cfg(unix)]
+    #[cfg_attr(not(test), allow(dead_code))]
     Shutdown,
-    #[allow(dead_code)] // constructed in signal.rs under #[cfg(unix)]
+    #[allow(dead_code)]
     Reload,
 }
 
@@ -427,7 +438,7 @@ pub enum SignalKind {
 
 /// Every output from the reducer. Effect executor performs these.
 /// Not all variants are emitted yet — the enum defines the complete protocol.
-#[allow(dead_code)] // Protocol enum: variants wired incrementally across phases
+#[expect(dead_code, reason = "protocol surface intentionally keeps not-yet-emitted commands")]
 #[derive(Debug, Clone)]
 pub enum Command {
     // ── Service management ──
@@ -546,7 +557,6 @@ impl AlertPriority {
 // ─── Cleanup level ─────────────────────────────────────────────
 
 /// Disk cleanup aggressiveness.
-#[allow(dead_code)] // Phase 4: constructed by disk policy
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CleanupLevel {
     /// `apt clean` + journal vacuum.

@@ -6,8 +6,9 @@
 use crate::config::CratonConfig;
 use crate::graph::DepGraph;
 use crate::model::{
-    Alert, AlertPriority, BackupPhase, Command, CommandRequest, EffectResult, Event, IncidentKind,
-    IncidentReport, RemediationAction, ResourceId, ServiceId, SignalKind, TaskKind,
+    Alert, AlertPriority, BackupPhase, Command, CommandRequest, EffectResult, Event,
+    HttpCommandResponse, IncidentKind, IncidentReport, RemediationAction, ResourceId, ServiceId,
+    SignalKind, TaskKind,
 };
 use crate::policy::{backup, recovery};
 use crate::schedule::WallClock;
@@ -43,7 +44,7 @@ pub fn reduce(
         Event::EffectCompleted { cmd_id, result } => {
             handle_effect_completed(state, cmd_id, &result, config, ctx)
         }
-        Event::HttpCommand(req) => handle_http_command(state, req, config, ctx),
+        Event::HttpCommand(req) => handle_http_command(state, req.command, config, ctx),
         Event::Signal(SignalKind::Shutdown) => handle_shutdown(state),
         Event::Signal(SignalKind::Reload) => vec![],
         Event::StartupRecovery { persisted_backup } => handle_startup_recovery(state, &persisted_backup, ctx),
@@ -108,6 +109,7 @@ fn handle_probes(
     graph: &DepGraph,
     ctx: &Ctx,
 ) -> Vec<Command> {
+    state.last_probe_cycle_mono = Some(ctx.mono_secs);
     let plan = recovery::evaluate(results, &state.services, config, graph, ctx.mono_secs);
 
     let mut cmds = Vec::new();
@@ -561,6 +563,42 @@ fn handle_http_command(
             config,
             ctx,
         ),
+    }
+}
+
+pub fn http_command_response(request: &CommandRequest, state: &State) -> HttpCommandResponse {
+    match request {
+        CommandRequest::Trigger(task) => HttpCommandResponse::Accepted {
+            detail: format!("task scheduled: {}", task_label(task)),
+        },
+        CommandRequest::Remediate { action, .. } => {
+            let Some(record) = state.remediation_log.iter().last() else {
+                return HttpCommandResponse::Error {
+                    error: format!("missing remediation record for {action:?}"),
+                };
+            };
+
+            if let Some(reason) = record.result.strip_prefix("rejected: ") {
+                HttpCommandResponse::Rejected {
+                    reason: reason.to_string(),
+                }
+            } else {
+                HttpCommandResponse::Accepted {
+                    detail: record.result.clone(),
+                }
+            }
+        }
+    }
+}
+
+fn task_label(task: &TaskKind) -> &'static str {
+    match task {
+        TaskKind::Recovery => "recovery",
+        TaskKind::Backup => "backup",
+        TaskKind::DiskMonitor => "disk_monitor",
+        TaskKind::AptUpdates => "apt_updates",
+        TaskKind::DockerUpdates => "docker_updates",
+        TaskKind::DailySummary => "daily_summary",
     }
 }
 
@@ -1313,7 +1351,9 @@ url = "http://localhost:8080/v1/health"
 
         let cmds = reduce(
             &mut state,
-            Event::HttpCommand(CommandRequest::Trigger(TaskKind::Recovery)),
+            Event::HttpCommand(crate::model::HttpCommandRequest::fire_and_forget(
+                CommandRequest::Trigger(TaskKind::Recovery),
+            )),
             &config,
             &graph,
             &ctx,
@@ -1331,12 +1371,14 @@ url = "http://localhost:8080/v1/health"
 
         let cmds = reduce(
             &mut state,
-            Event::HttpCommand(CommandRequest::Remediate {
-                action: RemediationAction::RestartService,
-                target: Some(ServiceId("ntfy".into())),
-                source: "picoclaw".into(),
-                reason: "test".into(),
-            }),
+            Event::HttpCommand(crate::model::HttpCommandRequest::fire_and_forget(
+                CommandRequest::Remediate {
+                    action: RemediationAction::RestartService,
+                    target: Some(ServiceId("ntfy".into())),
+                    source: "picoclaw".into(),
+                    reason: "test".into(),
+                },
+            )),
             &config,
             &graph,
             &ctx,
@@ -1367,12 +1409,14 @@ url = "http://localhost:8080/v1/health"
         let ctx = test_ctx(300);
         let _cmds = reduce(
             &mut state,
-            Event::HttpCommand(CommandRequest::Remediate {
-                action: RemediationAction::ClearBreaker,
-                target: Some(ServiceId("ntfy".into())),
-                source: "operator".into(),
-                reason: "manual reset".into(),
-            }),
+            Event::HttpCommand(crate::model::HttpCommandRequest::fire_and_forget(
+                CommandRequest::Remediate {
+                    action: RemediationAction::ClearBreaker,
+                    target: Some(ServiceId("ntfy".into())),
+                    source: "operator".into(),
+                    reason: "manual reset".into(),
+                },
+            )),
             &config,
             &graph,
             &ctx,
@@ -1451,12 +1495,14 @@ url = "http://localhost:8080/v1/health"
         for i in 0..3usize {
             let cmds = reduce(
                 &mut state,
-                Event::HttpCommand(CommandRequest::Remediate {
-                    action: RemediationAction::RestartService,
-                    target: Some(ServiceId("ntfy".into())),
-                    source: "http:api".into(),
-                    reason: format!("attempt {i}"),
-                }),
+                Event::HttpCommand(crate::model::HttpCommandRequest::fire_and_forget(
+                    CommandRequest::Remediate {
+                        action: RemediationAction::RestartService,
+                        target: Some(ServiceId("ntfy".into())),
+                        source: "http:api".into(),
+                        reason: format!("attempt {i}"),
+                    },
+                )),
                 &config,
                 &graph,
                 &ctx,
@@ -1472,12 +1518,14 @@ url = "http://localhost:8080/v1/health"
         // 4th attempt within the same hour must be rate-limited.
         let cmds = reduce(
             &mut state,
-            Event::HttpCommand(CommandRequest::Remediate {
-                action: RemediationAction::RestartService,
-                target: Some(ServiceId("ntfy".into())),
-                source: "http:api".into(),
-                reason: "over limit".into(),
-            }),
+            Event::HttpCommand(crate::model::HttpCommandRequest::fire_and_forget(
+                CommandRequest::Remediate {
+                    action: RemediationAction::RestartService,
+                    target: Some(ServiceId("ntfy".into())),
+                    source: "http:api".into(),
+                    reason: "over limit".into(),
+                },
+            )),
             &config,
             &graph,
             &ctx,
@@ -1507,12 +1555,14 @@ url = "http://localhost:8080/v1/health"
         for _ in 0..3 {
             reduce(
                 &mut state,
-                Event::HttpCommand(CommandRequest::Remediate {
-                    action: RemediationAction::RestartService,
-                    target: Some(ServiceId("ntfy".into())),
-                    source: "http:api".into(),
-                    reason: "fill".into(),
-                }),
+                Event::HttpCommand(crate::model::HttpCommandRequest::fire_and_forget(
+                    CommandRequest::Remediate {
+                        action: RemediationAction::RestartService,
+                        target: Some(ServiceId("ntfy".into())),
+                        source: "http:api".into(),
+                        reason: "fill".into(),
+                    },
+                )),
                 &config,
                 &graph,
                 &ctx_early,
@@ -1535,12 +1585,14 @@ url = "http://localhost:8080/v1/health"
         };
         let cmds = reduce(
             &mut state,
-            Event::HttpCommand(CommandRequest::Remediate {
-                action: RemediationAction::RestartService,
-                target: Some(ServiceId("ntfy".into())),
-                source: "http:api".into(),
-                reason: "after window".into(),
-            }),
+            Event::HttpCommand(crate::model::HttpCommandRequest::fire_and_forget(
+                CommandRequest::Remediate {
+                    action: RemediationAction::RestartService,
+                    target: Some(ServiceId("ntfy".into())),
+                    source: "http:api".into(),
+                    reason: "after window".into(),
+                },
+            )),
             &config,
             &graph,
             &ctx_later,

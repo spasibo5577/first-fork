@@ -9,8 +9,8 @@ use crate::effect;
 use crate::graph::DepGraph;
 use crate::http::SharedSnapshot;
 use crate::model::{
-    Alert, AlertPriority, BackupPhase, CleanupLevel, Command, EffectResult, Event, ProbeResult,
-    ServiceId, TaskKind,
+    Alert, AlertPriority, BackupPhase, CleanupLevel, Command, EffectResult, Event, ProbeError,
+    ProbeResult, ServiceId, TaskKind,
 };
 use crate::notify::{NotifyRuntimeState, NotifySender};
 use crate::reduce::{self, Ctx};
@@ -137,7 +137,22 @@ pub fn run_control_loop(
         match event_rx.recv_timeout(Duration::from_secs(1)) {
             Ok(event) => {
                 let ctx = make_ctx();
-                let cmds = reduce::reduce(&mut state, event, config, graph, &ctx);
+                let cmds = match event {
+                    Event::HttpCommand(req) => {
+                        let request = req.command.clone();
+                        let response_tx = req.response_tx.clone();
+                        let cmds =
+                            reduce::reduce(&mut state, Event::HttpCommand(req), config, graph, &ctx);
+                        if let Some(response_tx) = response_tx {
+                            let response = reduce::http_command_response(&request, &state);
+                            if response_tx.send(response).is_err() {
+                                crate::log::warn("http", "HTTP ACK receiver dropped before response");
+                            }
+                        }
+                        cmds
+                    }
+                    other => reduce::reduce(&mut state, other, config, graph, &ctx),
+                };
                 execute_commands(
                     &cmds, config, graph, &notifier, &snapshot, &mut state, sd_notify, &event_tx,
                 );
@@ -201,27 +216,30 @@ fn execute_commands(
                 );
             }
             Command::RestartService { id, unit, reason } => {
-                exec_service_action("restart", id, unit, reason);
+                exec_service_action("restart", id, unit, reason, state);
             }
             Command::StopService { id, unit, reason } => {
-                exec_service_action("stop", id, unit, reason);
+                exec_service_action("stop", id, unit, reason, state);
             }
             Command::StartService { id, unit } => {
-                eprintln!("[cratond] starting {id} ({unit})");
-                let _ = effect::exec::run_dry_aware(
+                crate::log::info("runtime", &format!("starting {id} ({unit})"));
+                let _ = exec_command_dry_aware(
+                    state,
+                    "systemctl_start_failed",
+                    &format!("systemctl start {unit} failed"),
                     &["systemctl", "start", unit],
                     Duration::from_secs(30),
                     false,
                 );
             }
             Command::RestartDockerDaemon { reason } => {
-                exec_docker_restart(reason);
+                exec_docker_restart(reason, state);
             }
             Command::SendAlert(alert) => {
                 notifier.queue(alert.clone());
             }
             Command::PersistBackupState(phase) => {
-                exec_persist_backup(phase);
+                exec_persist_backup(phase, state);
             }
             Command::PublishSnapshot => {
                 // Full publish happens every loop iteration; this is a no-op placeholder.
@@ -234,7 +252,7 @@ fn execute_commands(
                 state.shutting_down = true;
             }
             Command::ResticUnlock => {
-                exec_restic_unlock(config);
+                exec_restic_unlock(config, state);
             }
             Command::UpdateLlmContext => {
                 exec_update_llm_context(state, config);
@@ -245,10 +263,16 @@ fn execute_commands(
                     &format!("incident queued: {:?} service={:?}", report.kind, report.service),
                 );
                 let report = report.clone();
-                std::thread::Builder::new()
+                if let Err(e) = std::thread::Builder::new()
                     .name("incident-writer".into())
                     .spawn(move || effect::incident::write_report(&report))
-                    .ok();
+                {
+                    mark_runtime_degraded(
+                        state,
+                        "incident_writer_spawn_failed",
+                        &format!("failed to spawn incident writer: {e}"),
+                    );
+                }
             }
             Command::CheckDiskUsage => {
                 let mono = monotonic_secs();
@@ -258,29 +282,41 @@ fn execute_commands(
             }
             Command::RunDiskCleanup { level } => {
                 let level = *level;
-                std::thread::Builder::new()
+                if let Err(e) = std::thread::Builder::new()
                     .name("disk-cleanup".into())
                     .spawn(move || match level {
                         CleanupLevel::Standard => effect::disk::cleanup_standard(),
                         CleanupLevel::Aggressive => effect::disk::cleanup_aggressive(),
                     })
-                    .ok();
+                {
+                    mark_runtime_degraded(
+                        state,
+                        "disk_cleanup_spawn_failed",
+                        &format!("failed to spawn disk cleanup worker: {e}"),
+                    );
+                }
             }
             Command::CheckAptUpdates => {
-                std::thread::Builder::new()
+                if let Err(e) = std::thread::Builder::new()
                     .name("apt-check".into())
                     .spawn(|| {
                         if let Some(r) = effect::updates::check_apt() {
-                            eprintln!(
+                            crate::log::raw(&format!(
                                 "[cratond] APT: {} upgradeable, {} security",
                                 r.upgradeable, r.security
-                            );
+                            ));
                         }
                     })
-                    .ok();
+                {
+                    mark_runtime_degraded(
+                        state,
+                        "apt_check_spawn_failed",
+                        &format!("failed to spawn APT check worker: {e}"),
+                    );
+                }
             }
             Command::CheckDockerUpdates => {
-                eprintln!("[cratond] docker update check — no image list configured");
+                crate::log::raw("[cratond] docker update check — no image list configured");
             }
             Command::ResticBackup { paths } => {
                 let cmd_id = state.alloc_cmd_id();
@@ -290,7 +326,7 @@ fn execute_commands(
                 let repo = config.backup.restic_repo.clone();
                 let pass_file = config.backup.restic_password_file.clone();
                 let paths = paths.clone();
-                std::thread::Builder::new()
+                if let Err(e) = std::thread::Builder::new()
                     .name("restic-backup".into())
                     .spawn(move || {
                         let mut argv_owned: Vec<String> = vec![
@@ -311,7 +347,20 @@ fn execute_commands(
                             result: exec_to_effect_result(r),
                         });
                     })
-                    .ok();
+                {
+                    state.backup_pending_cmd = None;
+                    mark_runtime_degraded(
+                        state,
+                        "restic_backup_spawn_failed",
+                        &format!("failed to spawn restic backup worker: {e}"),
+                    );
+                    let _ = event_tx.send(Event::EffectCompleted {
+                        cmd_id,
+                        result: EffectResult::HelperError {
+                            message: format!("failed to spawn restic backup worker: {e}"),
+                        },
+                    });
+                }
             }
             Command::ResticForget {
                 daily,
@@ -327,7 +376,7 @@ fn execute_commands(
                 let daily = *daily;
                 let weekly = *weekly;
                 let monthly = *monthly;
-                std::thread::Builder::new()
+                if let Err(e) = std::thread::Builder::new()
                     .name("restic-forget".into())
                     .spawn(move || {
                         let daily_s = daily.to_string();
@@ -354,7 +403,20 @@ fn execute_commands(
                             result: exec_to_effect_result(r),
                         });
                     })
-                    .ok();
+                {
+                    state.backup_pending_cmd = None;
+                    mark_runtime_degraded(
+                        state,
+                        "restic_forget_spawn_failed",
+                        &format!("failed to spawn restic forget worker: {e}"),
+                    );
+                    let _ = event_tx.send(Event::EffectCompleted {
+                        cmd_id,
+                        result: EffectResult::HelperError {
+                            message: format!("failed to spawn restic forget worker: {e}"),
+                        },
+                    });
+                }
             }
             Command::ResticCheck { subset_percent } => {
                 let cmd_id = state.alloc_cmd_id();
@@ -364,7 +426,7 @@ fn execute_commands(
                 let repo = config.backup.restic_repo.clone();
                 let pass_file = config.backup.restic_password_file.clone();
                 let pct = *subset_percent;
-                std::thread::Builder::new()
+                if let Err(e) = std::thread::Builder::new()
                     .name("restic-check".into())
                     .spawn(move || {
                         let pct_s = format!("{pct}%");
@@ -384,7 +446,20 @@ fn execute_commands(
                             result: exec_to_effect_result(r),
                         });
                     })
-                    .ok();
+                {
+                    state.backup_pending_cmd = None;
+                    mark_runtime_degraded(
+                        state,
+                        "restic_check_spawn_failed",
+                        &format!("failed to spawn restic check worker: {e}"),
+                    );
+                    let _ = event_tx.send(Event::EffectCompleted {
+                        cmd_id,
+                        result: EffectResult::HelperError {
+                            message: format!("failed to spawn restic check worker: {e}"),
+                        },
+                    });
+                }
             }
             Command::PersistMaintenance => {
                 exec_persist_maintenance(state);
@@ -400,7 +475,7 @@ fn execute_commands(
             Command::AcquireLease { resource, holder } => {
                 let mono = monotonic_secs();
                 let res = state.leases.acquire(resource.clone(), holder, mono);
-                eprintln!("[cratond] lease {resource:?} → {holder}: {res:?}");
+                crate::log::raw(&format!("[cratond] lease {resource:?} → {holder}: {res:?}"));
             }
             Command::ReleaseLease { resource } => {
                 state.leases.force_release(resource);
@@ -422,7 +497,7 @@ fn exec_run_probes(
     sd_notify: &crate::effect::systemd::SdNotify,
     event_tx: &mpsc::Sender<Event>,
 ) {
-    let results = run_probes(service_ids, config);
+    let results = run_probes(service_ids, config, state);
     let ctx = make_ctx();
     let sub_cmds = reduce::reduce(state, Event::ProbeResults(results), config, graph, &ctx);
     execute_commands(
@@ -430,38 +505,123 @@ fn exec_run_probes(
     );
 }
 
-fn exec_service_action(action: &str, id: &ServiceId, unit: &str, reason: &str) {
-    eprintln!("[cratond] {action} {id} ({unit}): {reason}");
-    let _ =
-        effect::exec::run_dry_aware(&["systemctl", action, unit], Duration::from_secs(30), false);
+fn mark_runtime_degraded(state: &mut State, reason: &str, message: &str) {
+    crate::log::error("runtime", message);
+    state.mark_degraded(reason.to_string());
 }
 
-fn exec_docker_restart(reason: &str) {
-    eprintln!("[cratond] restarting Docker daemon: {reason}");
-    let _ = effect::exec::run(
+fn exec_command(
+    state: &mut State,
+    degraded_reason: &str,
+    error_context: &str,
+    argv: &[&str],
+    timeout: Duration,
+) -> Option<effect::exec::ExecResult> {
+    match effect::exec::run(argv, timeout) {
+        Ok(result) => {
+            if result.exit_code != 0 || result.killed {
+                mark_runtime_degraded(
+                    state,
+                    degraded_reason,
+                    &format!(
+                        "{error_context}: exit_code={} killed={} stderr={}",
+                        result.exit_code,
+                        result.killed,
+                        result.stderr_text()
+                    ),
+                );
+            }
+            Some(result)
+        }
+        Err(e) => {
+            mark_runtime_degraded(state, degraded_reason, &format!("{error_context}: {e}"));
+            None
+        }
+    }
+}
+
+fn exec_command_dry_aware(
+    state: &mut State,
+    degraded_reason: &str,
+    error_context: &str,
+    argv: &[&str],
+    timeout: Duration,
+    dry_run: bool,
+) -> Option<effect::exec::ExecResult> {
+    match effect::exec::run_dry_aware(argv, timeout, dry_run) {
+        Ok(result) => {
+            if result.exit_code != 0 || result.killed {
+                mark_runtime_degraded(
+                    state,
+                    degraded_reason,
+                    &format!(
+                        "{error_context}: exit_code={} killed={} stderr={}",
+                        result.exit_code,
+                        result.killed,
+                        result.stderr_text()
+                    ),
+                );
+            }
+            Some(result)
+        }
+        Err(e) => {
+            mark_runtime_degraded(state, degraded_reason, &format!("{error_context}: {e}"));
+            None
+        }
+    }
+}
+
+fn exec_service_action(action: &str, id: &ServiceId, unit: &str, reason: &str, state: &mut State) {
+    crate::log::info("runtime", &format!("{action} {id} ({unit}): {reason}"));
+    let _ = exec_command_dry_aware(
+        state,
+        "systemctl_action_failed",
+        &format!("systemctl {action} {unit} failed"),
+        &["systemctl", action, unit],
+        Duration::from_secs(30),
+        false,
+    );
+}
+
+fn exec_docker_restart(reason: &str, state: &mut State) {
+    crate::log::warn("runtime", &format!("restarting Docker daemon: {reason}"));
+    let _ = exec_command(
+        state,
+        "docker_kill_failed",
+        "systemctl kill docker.service failed",
         &["systemctl", "kill", "-s", "SIGKILL", "docker.service"],
         Duration::from_secs(15),
     );
     std::thread::sleep(Duration::from_secs(3));
-    let _ = effect::exec::run(
+    let _ = exec_command(
+        state,
+        "docker_start_failed",
+        "systemctl start docker.service failed",
         &["systemctl", "start", "docker.service"],
         Duration::from_secs(30),
     );
 }
 
-fn exec_persist_backup(phase: &BackupPhase) {
+fn exec_persist_backup(phase: &BackupPhase, state: &mut State) {
     let data = serde_json::to_vec_pretty(phase).unwrap_or_else(|_| b"{}".to_vec());
     if let Err(e) = crate::persist::atomic_write(
         std::path::Path::new("/var/lib/craton/backup-state.json"),
         &data,
     ) {
-        eprintln!("[cratond] failed to persist backup state: {e}");
+        mark_runtime_degraded(
+            state,
+            "backup_state_persist_failed",
+            &format!("failed to persist backup state: {e}"),
+        );
     }
 }
 
-fn exec_restic_unlock(config: &CratonConfig) {
-    eprintln!("[cratond] running restic unlock");
-    let _ = effect::exec::run(
+fn exec_restic_unlock(config: &CratonConfig, state: &mut State) {
+    crate::log::info("runtime", "running restic unlock");
+    let _ = exec_command(
+        state,
+        "restic_unlock_failed",
+        "restic unlock failed",
         &[
             &config.backup.restic_binary,
             "unlock",
@@ -474,7 +634,7 @@ fn exec_restic_unlock(config: &CratonConfig) {
     );
 }
 
-fn exec_update_llm_context(state: &State, config: &CratonConfig) {
+fn exec_update_llm_context(state: &mut State, config: &CratonConfig) {
     let snap = build_snapshot_json(
         state,
         StartupKind::Unknown,
@@ -485,23 +645,64 @@ fn exec_update_llm_context(state: &State, config: &CratonConfig) {
         std::path::Path::new(&config.ai.context_path),
         snap.as_bytes(),
     ) {
-        eprintln!("[cratond] failed to write LLM context: {e}");
+        mark_runtime_degraded(
+            state,
+            "llm_context_persist_failed",
+            &format!("failed to write LLM context: {e}"),
+        );
     }
 }
 
 // ─── Probes ────────────────────────────────────────────────────
 
-fn run_probes(service_ids: &[ServiceId], config: &CratonConfig) -> Vec<ProbeResult> {
+fn run_probes(service_ids: &[ServiceId], config: &CratonConfig, state: &mut State) -> Vec<ProbeResult> {
     std::thread::scope(|s| {
-        let handles: Vec<_> = service_ids
-            .iter()
-            .filter_map(|sid| {
-                let svc = config.find_service(sid)?;
-                Some(s.spawn(move || effect::probe::run_probe(&svc.id, &svc.probe, &svc.unit)))
-            })
-            .collect();
+        let mut handles = Vec::new();
+        let mut results = Vec::new();
 
-        handles.into_iter().filter_map(|h| h.join().ok()).collect()
+        for sid in service_ids {
+            let Some(svc) = config.find_service(sid) else {
+                continue;
+            };
+
+            match std::thread::Builder::new()
+                .name(format!("probe-{}", sid.as_str()))
+                .spawn_scoped(s, move || effect::probe::run_probe(&svc.id, &svc.probe, &svc.unit))
+            {
+                Ok(handle) => handles.push((sid.clone(), handle)),
+                Err(e) => {
+                    mark_runtime_degraded(
+                        state,
+                        "probe_spawn_failed",
+                        &format!("failed to spawn probe worker for {}: {e}", sid.as_str()),
+                    );
+                    results.push(ProbeResult::Unhealthy {
+                        service: sid.clone(),
+                        error: ProbeError::Timeout,
+                        latency_ms: 0,
+                    });
+                }
+            }
+        }
+
+        for (sid, handle) in handles {
+            if let Ok(result) = handle.join() {
+                results.push(result);
+            } else {
+                mark_runtime_degraded(
+                    state,
+                    "probe_worker_panicked",
+                    &format!("probe worker panicked for {}", sid.as_str()),
+                );
+                results.push(ProbeResult::Unhealthy {
+                    service: sid,
+                    error: ProbeError::Timeout,
+                    latency_ms: 0,
+                });
+            }
+        }
+
+        results
     })
 }
 
@@ -542,9 +743,10 @@ fn build_snapshot_json(
         "remediation_history": state.remediation_log.to_vec(),
         "snapshot_epoch_secs": epoch_secs_now(),
         "last_recovery_mono": state.last_recovery_mono,
-        "start_mono": state.start_mono,
+        "last_probe_cycle_mono": state.last_probe_cycle_mono,
         "startup_kind": startup_kind.label(),
         "outbox_overflow": outbox_overflow.load(Ordering::Relaxed),
+        "degraded_reasons": state.degraded_reasons.clone(),
         "notify_degraded": notify_runtime_state.degraded(),
         "notify_consecutive_failures": notify_runtime_state.consecutive_failures(),
         "notify_last_success_epoch_secs": notify_runtime_state.last_success_epoch_secs(),
@@ -561,7 +763,7 @@ fn load_persisted_maintenance(state: &mut State, now_mono: u64) {
         Ok(Some(d)) => d,
         Ok(None) => return,
         Err(e) => {
-            eprintln!("[cratond] failed to read maintenance.json: {e}");
+            crate::log::raw(&format!("[cratond] failed to read maintenance.json: {e}"));
             return;
         }
     };
@@ -570,7 +772,7 @@ fn load_persisted_maintenance(state: &mut State, now_mono: u64) {
         match serde_json::from_slice(&data) {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("[cratond] failed to parse maintenance.json: {e}");
+                crate::log::raw(&format!("[cratond] failed to parse maintenance.json: {e}"));
                 return;
             }
         };
@@ -589,7 +791,9 @@ fn load_persisted_maintenance(state: &mut State, now_mono: u64) {
             loaded += 1;
         }
     }
-    eprintln!("[cratond] maintenance loaded: {loaded} active, {expired} expired");
+    crate::log::raw(&format!(
+        "[cratond] maintenance loaded: {loaded} active, {expired} expired"
+    ));
 }
 
 fn load_persisted_backup_phase() -> BackupPhase {
@@ -601,14 +805,14 @@ fn load_persisted_backup_phase() -> BackupPhase {
             let legacy = std::path::Path::new("/var/lib/granit/backup-state.json");
             match crate::persist::read_optional(legacy) {
                 Ok(Some(data)) => {
-                    eprintln!("[cratond] migrating backup state from Go monolith");
+                    crate::log::raw("[cratond] migrating backup state from Go monolith");
                     serde_json::from_slice(&data).unwrap_or(BackupPhase::Idle)
                 }
                 _ => BackupPhase::Idle,
             }
         }
         Err(e) => {
-            eprintln!("[cratond] failed to read backup state: {e}");
+            crate::log::raw(&format!("[cratond] failed to read backup state: {e}"));
             BackupPhase::Idle
         }
     }
@@ -720,7 +924,7 @@ fn exec_to_effect_result(
     }
 }
 
-fn exec_persist_maintenance(state: &State) {
+fn exec_persist_maintenance(state: &mut State) {
     // Collect non-expired maintenance entries keyed by service id.
     let entries: std::collections::BTreeMap<String, &crate::state::Maintenance> = state
         .services
@@ -734,10 +938,18 @@ fn exec_persist_maintenance(state: &State) {
                 std::path::Path::new("/var/lib/craton/maintenance.json"),
                 &data,
             ) {
-                eprintln!("[cratond] failed to persist maintenance: {e}");
+                mark_runtime_degraded(
+                    state,
+                    "maintenance_persist_failed",
+                    &format!("failed to persist maintenance: {e}"),
+                );
             }
         }
-        Err(e) => eprintln!("[cratond] failed to serialize maintenance: {e}"),
+        Err(e) => mark_runtime_degraded(
+            state,
+            "maintenance_serialize_failed",
+            &format!("failed to serialize maintenance: {e}"),
+        ),
     }
 }
 
@@ -956,10 +1168,12 @@ url = "http://127.0.0.1:8080/v1/health"
 "#,
         )
         .unwrap_or_else(|e| panic!("config parse failed: {e}"));
-        let state = State::new(&config, 1);
+        let mut state = State::new(&config, 1);
         let outbox = Arc::new(AtomicBool::new(true));
         let notify_state = NotifyRuntimeState::new();
         notify_state.record_delivery_failure();
+        state.last_probe_cycle_mono = Some(monotonic_secs());
+        state.mark_degraded("probe_spawn_failed");
 
         let snap = build_snapshot_json(&state, StartupKind::HostBoot, &outbox, &notify_state);
         let parsed: serde_json::Value =
@@ -967,6 +1181,9 @@ url = "http://127.0.0.1:8080/v1/health"
 
         assert_eq!(parsed["outbox_overflow"], true);
         assert_eq!(parsed["startup_kind"], "host_boot");
+        assert!(parsed.get("start_mono").is_none());
+        assert_eq!(parsed["last_probe_cycle_mono"].as_u64(), state.last_probe_cycle_mono);
+        assert_eq!(parsed["degraded_reasons"], serde_json::json!(["probe_spawn_failed"]));
         assert_eq!(parsed["notify_degraded"], true);
         assert_eq!(parsed["notify_consecutive_failures"], 1);
         assert!(parsed["notify_last_failure_epoch_secs"].as_u64().unwrap_or(0) > 0);

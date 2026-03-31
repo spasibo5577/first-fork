@@ -34,12 +34,14 @@ pub struct State {
     pub last_docker_day: Option<u32>,
     pub last_summary_day: Option<u32>,
     pub last_recovery_mono: Option<u64>,
+    pub last_probe_cycle_mono: Option<u64>,
     pub last_disk_mono: Option<u64>,
     pub backup_pending_cmd: Option<u64>,
     pub consecutive_backup_failures: u32,
     pub next_cmd_id: u64,
     pub start_mono: u64,
     pub shutting_down: bool,
+    pub degraded_reasons: Vec<String>,
 }
 
 impl State {
@@ -65,12 +67,14 @@ impl State {
             last_docker_day: None,
             last_summary_day: None,
             last_recovery_mono: None,
+            last_probe_cycle_mono: None,
             last_disk_mono: None,
             backup_pending_cmd: None,
             consecutive_backup_failures: 0,
             next_cmd_id: 1,
             start_mono,
             shutting_down: false,
+            degraded_reasons: Vec::new(),
         }
     }
 
@@ -80,6 +84,13 @@ impl State {
         let id = self.next_cmd_id;
         self.next_cmd_id += 1;
         id
+    }
+
+    pub fn mark_degraded<S: Into<String>>(&mut self, reason: S) {
+        let reason = reason.into();
+        if !self.degraded_reasons.iter().any(|existing| existing == &reason) {
+            self.degraded_reasons.push(reason);
+        }
     }
 }
 

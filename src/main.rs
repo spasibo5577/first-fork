@@ -29,6 +29,7 @@ mod state;
 
 use model::{Event, SignalKind};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
@@ -70,9 +71,24 @@ fn load_or_create_token(token_path: &str) -> Result<String, String> {
 
     persist::atomic_write(path, token.as_bytes())
         .map_err(|e| format!("persisting remediation token to {token_path}: {e}"))?;
+    restrict_token_permissions(path)
+        .map_err(|e| format!("setting permissions on remediation token {token_path}: {e}"))?;
     crate::log::info("startup", "remediation token persisted");
 
     Ok(token)
+}
+
+#[cfg(unix)]
+fn restrict_token_permissions(path: &std::path::Path) -> Result<(), std::io::Error> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
+fn restrict_token_permissions(_path: &std::path::Path) -> Result<(), std::io::Error> {
+    Ok(())
 }
 
 fn ensure_runtime_dirs(paths: &[&str]) -> Result<(), String> {
@@ -179,11 +195,18 @@ fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     // HTTP API.
     let snapshot = http::empty_snapshot();
     let remediation_token = load_or_create_token(&cfg.ai.token_path)?;
+    let known_services = Arc::new(
+        cfg.services
+            .iter()
+            .map(|service| service.id.as_str().to_string())
+            .collect::<BTreeSet<_>>(),
+    );
     http::spawn_http_thread(
         &cfg.daemon.listen,
         snapshot.clone(),
         event_tx.clone(),
         remediation_token,
+        known_services,
     )?;
 
     // ── Phase 5: Run control loop (blocks until shutdown) ──
@@ -244,6 +267,34 @@ mod tests {
                 .unwrap_or_else(|| panic!("temp path should be valid UTF-8")),
         );
         assert!(result.is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_or_create_token_sets_permissions_to_600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("craton_token_mode_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("create test dir: {e}"));
+
+        let token_path = dir.join("remediation-token");
+        let token = load_or_create_token(
+            token_path
+                .to_str()
+                .unwrap_or_else(|| panic!("temp path should be valid UTF-8")),
+        )
+        .unwrap_or_else(|e| panic!("token creation failed: {e}"));
+        assert!(!token.is_empty());
+
+        let mode = std::fs::metadata(&token_path)
+            .unwrap_or_else(|e| panic!("metadata failed: {e}"))
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

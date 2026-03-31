@@ -10,7 +10,11 @@
 //! The token is loaded/generated at startup and written to `ai.token_path`.
 //! The token is NEVER written to the audit trail — `source` is always `"http:api"`.
 
-use crate::model::{CommandRequest, Event, RemediationAction, ServiceId, TaskKind};
+use crate::model::{
+    CommandRequest, Event, HttpCommandRequest, HttpCommandResponse, RemediationAction, ServiceId,
+    TaskKind,
+};
+use std::collections::BTreeSet;
 use std::io::Read;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -36,16 +40,17 @@ pub fn spawn_http_thread(
     snapshot: SharedSnapshot,
     event_tx: mpsc::Sender<Event>,
     token: String,
+    known_services: Arc<BTreeSet<String>>,
 ) -> Result<(), String> {
     let server = tiny_http::Server::http(listen_addr)
         .map_err(|e| format!("HTTP bind {listen_addr}: {e}"))?;
 
-    eprintln!("[cratond] HTTP API listening on {listen_addr}");
+    crate::log::raw(&format!("[cratond] HTTP API listening on {listen_addr}"));
 
     std::thread::Builder::new()
         .name("http-api".into())
         .spawn(move || {
-            serve(server, snapshot, event_tx, token);
+            serve(server, snapshot, event_tx, token, known_services);
         })
         .map_err(|e| format!("spawning HTTP thread: {e}"))?;
 
@@ -58,6 +63,7 @@ fn serve(
     snapshot: SharedSnapshot,
     event_tx: mpsc::Sender<Event>,
     token: String,
+    known_services: Arc<BTreeSet<String>>,
 ) {
     for mut request in server.incoming_requests() {
         let method = request.method().to_string();
@@ -69,7 +75,9 @@ fn serve(
             ("GET", path) if path.starts_with("/api/v1/history/") => {
                 handle_history(&snapshot, path)
             }
-            ("GET", path) if path.starts_with("/api/v1/diagnose/") => handle_diagnose(path),
+            ("GET", path) if path.starts_with("/api/v1/diagnose/") => {
+                handle_diagnose(path, &known_services)
+            }
             ("POST", path) if path.starts_with("/trigger/") => {
                 let auth = authorization_header(&request);
                 handle_trigger(path, &auth, &event_tx, &token)
@@ -79,7 +87,7 @@ fn serve(
         };
 
         if let Err(e) = request.respond(response) {
-            eprintln!("[cratond] HTTP response error: {e}");
+            crate::log::raw(&format!("[cratond] HTTP response error: {e}"));
         }
     }
 }
@@ -91,8 +99,14 @@ fn handle_health(snapshot: &SharedSnapshot) -> tiny_http::Response<std::io::Curs
     };
 
     let parsed = serde_json::from_str::<serde_json::Value>(&snap).unwrap_or_default();
-    let now_epoch = epoch_secs_now();
+    health_response(&parsed, epoch_secs_now(), monotonic_secs_now())
+}
 
+fn health_response(
+    parsed: &serde_json::Value,
+    now_epoch: u64,
+    now_mono: u64,
+) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
     let stale_snapshot = parsed
         .get("snapshot_epoch_secs")
         .and_then(serde_json::Value::as_u64)
@@ -109,12 +123,37 @@ fn handle_health(snapshot: &SharedSnapshot) -> tiny_http::Response<std::io::Curs
         return json_response(503, r#"{"status":"unavailable","reason":"outbox_overflow"}"#);
     }
 
+    let stale_probe_cycle = parsed
+        .get("last_probe_cycle_mono")
+        .and_then(serde_json::Value::as_u64)
+        .is_none_or(|last_probe| now_mono.saturating_sub(last_probe) > 600);
+    if stale_probe_cycle {
+        return json_response(503, r#"{"status":"unavailable","reason":"stale_health_cycle"}"#);
+    }
+
     let shutting_down = parsed
         .get("shutting_down")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     if shutting_down {
         return json_response(503, r#"{"status":"unavailable","reason":"shutting_down"}"#);
+    }
+
+    let degraded_reasons = parsed
+        .get("degraded_reasons")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if !degraded_reasons.is_empty() {
+        return json_response(
+            503,
+            &serde_json::json!({
+                "status": "unavailable",
+                "reason": "degraded",
+                "degraded_reasons": degraded_reasons,
+            })
+            .to_string(),
+        );
     }
 
     json_response(200, r#"{"status":"ok","reason":"ok"}"#)
@@ -125,6 +164,26 @@ fn epoch_secs_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+fn monotonic_secs_now() -> u64 {
+    #[cfg(unix)]
+    {
+        let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+        }
+        ts.tv_sec as u64
+    }
+
+    #[cfg(not(unix))]
+    {
+        use std::sync::OnceLock;
+        use std::time::Instant;
+
+        static START: OnceLock<Instant> = OnceLock::new();
+        START.get_or_init(Instant::now).elapsed().as_secs()
+    }
 }
 
 fn handle_state(snapshot: &SharedSnapshot) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
@@ -169,10 +228,16 @@ fn handle_history(
     json_response(200, &response_value.to_string())
 }
 
-fn handle_diagnose(path: &str) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
+fn handle_diagnose(
+    path: &str,
+    known_services: &BTreeSet<String>,
+) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
     let service_name = path.strip_prefix("/api/v1/diagnose/").unwrap_or("");
     if service_name.is_empty() {
         return json_response(400, r#"{"error":"service name required"}"#);
+    }
+    if !known_services.contains(service_name) {
+        return json_response(404, &format!(r#"{{"error":"unknown service: {service_name}"}}"#));
     }
 
     let unit = format!("{service_name}.service");
@@ -226,7 +291,19 @@ fn is_authorized_bearer(auth_header: &str, expected_token: &str) -> bool {
         .unwrap_or("")
         .trim();
 
-    !expected_token.is_empty() && provided == expected_token
+    !expected_token.is_empty() && constant_time_eq(provided.as_bytes(), expected_token.as_bytes())
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 fn handle_trigger(
@@ -234,6 +311,22 @@ fn handle_trigger(
     auth_header: &str,
     event_tx: &mpsc::Sender<Event>,
     expected_token: &str,
+) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
+    handle_trigger_with_timeout(
+        path,
+        auth_header,
+        event_tx,
+        expected_token,
+        std::time::Duration::from_secs(10),
+    )
+}
+
+fn handle_trigger_with_timeout(
+    path: &str,
+    auth_header: &str,
+    event_tx: &mpsc::Sender<Event>,
+    expected_token: &str,
+    ack_timeout: std::time::Duration,
 ) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
     if !is_authorized_bearer(auth_header, expected_token) {
         return json_response(401, r#"{"error":"unauthorized"}"#);
@@ -254,13 +347,36 @@ fn handle_trigger(
         }
     };
 
-    let event = Event::HttpCommand(CommandRequest::Trigger(task_kind));
+    let (response_tx, response_rx) = mpsc::channel();
+    let event = Event::HttpCommand(HttpCommandRequest::with_response(
+        CommandRequest::Trigger(task_kind),
+        response_tx,
+    ));
 
     match event_tx.send(event) {
-        Ok(()) => json_response(
-            202,
-            &format!(r#"{{"status":"accepted","task":"{task_name}"}}"#),
-        ),
+        Ok(()) => match response_rx.recv_timeout(ack_timeout) {
+            Ok(HttpCommandResponse::Accepted { detail }) => json_response(
+                200,
+                &serde_json::json!({
+                    "status": "completed",
+                    "task": task_name,
+                    "detail": detail,
+                })
+                .to_string(),
+            ),
+            Ok(HttpCommandResponse::Rejected { reason }) => {
+                json_response(409, &serde_json::json!({ "error": reason }).to_string())
+            }
+            Ok(HttpCommandResponse::Error { error }) => {
+                json_response(500, &serde_json::json!({ "error": error }).to_string())
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                json_response(504, r#"{"error":"control loop did not respond in time"}"#)
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                json_response(503, r#"{"error":"control loop terminated"}"#)
+            }
+        },
         Err(_) => json_response(503, r#"{"error":"control loop unavailable"}"#),
     }
 }
@@ -276,6 +392,20 @@ fn handle_remediate(
     request: &mut tiny_http::Request,
     event_tx: &mpsc::Sender<Event>,
     expected_token: &str,
+) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
+    handle_remediate_with_timeout(
+        request,
+        event_tx,
+        expected_token,
+        std::time::Duration::from_secs(10),
+    )
+}
+
+fn handle_remediate_with_timeout(
+    request: &mut tiny_http::Request,
+    event_tx: &mpsc::Sender<Event>,
+    expected_token: &str,
+    ack_timeout: std::time::Duration,
 ) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
     let auth = authorization_header(request);
     if !is_authorized_bearer(&auth, expected_token) {
@@ -327,15 +457,40 @@ fn handle_remediate(
         .unwrap_or("http api")
         .to_string();
 
-    let event = Event::HttpCommand(CommandRequest::Remediate {
-        action,
-        target,
-        source: "http:api".to_string(),
-        reason,
-    });
+    let (response_tx, response_rx) = mpsc::channel();
+    let event = Event::HttpCommand(HttpCommandRequest::with_response(
+        CommandRequest::Remediate {
+            action,
+            target,
+            source: "http:api".to_string(),
+            reason,
+        },
+        response_tx,
+    ));
 
     match event_tx.send(event) {
-        Ok(()) => json_response(202, r#"{"status":"accepted"}"#),
+        Ok(()) => match response_rx.recv_timeout(ack_timeout) {
+            Ok(HttpCommandResponse::Accepted { detail }) => json_response(
+                200,
+                &serde_json::json!({
+                    "status": "completed",
+                    "detail": detail,
+                })
+                .to_string(),
+            ),
+            Ok(HttpCommandResponse::Rejected { reason }) => {
+                json_response(409, &serde_json::json!({ "error": reason }).to_string())
+            }
+            Ok(HttpCommandResponse::Error { error }) => {
+                json_response(500, &serde_json::json!({ "error": error }).to_string())
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                json_response(504, r#"{"error":"control loop did not respond in time"}"#)
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                json_response(503, r#"{"error":"control loop terminated"}"#)
+            }
+        },
         Err(_) => json_response(503, r#"{"error":"control loop unavailable"}"#),
     }
 }
@@ -378,12 +533,18 @@ mod tests {
         Arc::new(Mutex::new(value.to_string()))
     }
 
+    fn known_services() -> BTreeSet<String> {
+        BTreeSet::from(["ntfy".to_string(), "unbound".to_string()])
+    }
+
     #[test]
     fn health_returns_200_for_fresh_snapshot() {
         let snapshot_value = serde_json::json!({
             "snapshot_epoch_secs": epoch_secs_now(),
+            "last_probe_cycle_mono": monotonic_secs_now(),
             "outbox_overflow": false,
             "shutting_down": false,
+            "degraded_reasons": [],
             "services": {}
         });
         let snapshot = snapshot_with(&snapshot_value);
@@ -399,8 +560,10 @@ mod tests {
     fn health_returns_503_for_stale_snapshot() {
         let snapshot_value = serde_json::json!({
             "snapshot_epoch_secs": epoch_secs_now().saturating_sub(31),
+            "last_probe_cycle_mono": monotonic_secs_now(),
             "outbox_overflow": false,
             "shutting_down": false,
+            "degraded_reasons": [],
             "services": {}
         });
         let snapshot = snapshot_with(&snapshot_value);
@@ -416,8 +579,10 @@ mod tests {
     fn health_returns_503_for_outbox_overflow() {
         let snapshot_value = serde_json::json!({
             "snapshot_epoch_secs": epoch_secs_now(),
+            "last_probe_cycle_mono": monotonic_secs_now(),
             "outbox_overflow": true,
             "shutting_down": false,
+            "degraded_reasons": [],
             "services": {}
         });
         let snapshot = snapshot_with(&snapshot_value);
@@ -433,8 +598,10 @@ mod tests {
     fn health_returns_503_when_shutting_down() {
         let snapshot_value = serde_json::json!({
             "snapshot_epoch_secs": epoch_secs_now(),
+            "last_probe_cycle_mono": monotonic_secs_now(),
             "outbox_overflow": false,
             "shutting_down": true,
+            "degraded_reasons": [],
             "services": {}
         });
         let snapshot = snapshot_with(&snapshot_value);
@@ -450,8 +617,10 @@ mod tests {
     fn health_ignores_service_failure_details_when_typed_health_fields_are_ok() {
         let snapshot_value = serde_json::json!({
             "snapshot_epoch_secs": epoch_secs_now(),
+            "last_probe_cycle_mono": monotonic_secs_now(),
             "outbox_overflow": false,
             "shutting_down": false,
+            "degraded_reasons": [],
             "services": {
                 "ntfy": { "status": "failed", "error": "boom", "since_mono": 1 }
             }
@@ -463,6 +632,44 @@ mod tests {
         assert_eq!(status, tiny_http::StatusCode(200));
         assert_eq!(data["status"], "ok");
         assert_eq!(data["reason"], "ok");
+    }
+
+    #[test]
+    fn health_returns_503_for_stale_probe_cycle() {
+        let snapshot_value = serde_json::json!({
+            "snapshot_epoch_secs": 1_700_000_000u64,
+            "last_probe_cycle_mono": 100u64,
+            "outbox_overflow": false,
+            "shutting_down": false,
+            "degraded_reasons": [],
+            "services": {}
+        });
+
+        let (status, data) = read_json(health_response(&snapshot_value, 1_700_000_000, 701));
+
+        assert_eq!(status, tiny_http::StatusCode(503));
+        assert_eq!(data["status"], "unavailable");
+        assert_eq!(data["reason"], "stale_health_cycle");
+    }
+
+    #[test]
+    fn health_returns_503_when_degraded_reasons_present() {
+        let snapshot_value = serde_json::json!({
+            "snapshot_epoch_secs": epoch_secs_now(),
+            "last_probe_cycle_mono": monotonic_secs_now(),
+            "outbox_overflow": false,
+            "shutting_down": false,
+            "degraded_reasons": ["probe_spawn_failed"],
+            "services": {}
+        });
+        let snapshot = snapshot_with(&snapshot_value);
+
+        let (status, data) = read_json(handle_health(&snapshot));
+
+        assert_eq!(status, tiny_http::StatusCode(503));
+        assert_eq!(data["status"], "unavailable");
+        assert_eq!(data["reason"], "degraded");
+        assert_eq!(data["degraded_reasons"], serde_json::json!(["probe_spawn_failed"]));
     }
 
     #[test]
@@ -493,20 +700,85 @@ mod tests {
     #[test]
     fn trigger_with_valid_bearer_token_accepts_known_task() {
         let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let event = rx.recv().unwrap();
+            let Event::HttpCommand(req) = event else {
+                panic!("expected HttpCommand");
+            };
+            assert_eq!(req.command, CommandRequest::Trigger(TaskKind::Recovery));
+            req.response_tx
+                .unwrap_or_else(|| panic!("response channel missing"))
+                .send(HttpCommandResponse::Accepted {
+                    detail: "task scheduled: recovery".to_string(),
+                })
+                .unwrap();
+        });
 
-        let (status, data) = read_json(handle_trigger(
+        let (status, data) = read_json(handle_trigger_with_timeout(
             "/trigger/recovery",
             "Bearer secret-token",
             &tx,
             "secret-token",
+            std::time::Duration::from_millis(50),
         ));
 
-        assert_eq!(status, tiny_http::StatusCode(202));
-        assert_eq!(data, serde_json::json!({"status":"accepted","task":"recovery"}));
-        assert!(matches!(
-            rx.recv().unwrap(),
-            Event::HttpCommand(CommandRequest::Trigger(TaskKind::Recovery))
+        assert_eq!(status, tiny_http::StatusCode(200));
+        assert_eq!(
+            data,
+            serde_json::json!({
+                "status":"completed",
+                "task":"recovery",
+                "detail":"task scheduled: recovery"
+            })
+        );
+    }
+
+    #[test]
+    fn trigger_can_return_rejected_response() {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let event = rx.recv().unwrap();
+            let Event::HttpCommand(req) = event else {
+                panic!("expected HttpCommand");
+            };
+            req.response_tx
+                .unwrap_or_else(|| panic!("response channel missing"))
+                .send(HttpCommandResponse::Rejected {
+                    reason: "rate limited".to_string(),
+                })
+                .unwrap();
+        });
+
+        let (status, data) = read_json(handle_trigger_with_timeout(
+            "/trigger/recovery",
+            "Bearer secret-token",
+            &tx,
+            "secret-token",
+            std::time::Duration::from_millis(50),
         ));
+
+        assert_eq!(status, tiny_http::StatusCode(409));
+        assert_eq!(data, serde_json::json!({"error":"rate limited"}));
+    }
+
+    #[test]
+    fn trigger_times_out_when_control_loop_does_not_ack() {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _event = rx.recv().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        });
+
+        let (status, data) = read_json(handle_trigger_with_timeout(
+            "/trigger/recovery",
+            "Bearer secret-token",
+            &tx,
+            "secret-token",
+            std::time::Duration::from_millis(10),
+        ));
+
+        assert_eq!(status, tiny_http::StatusCode(504));
+        assert_eq!(data, serde_json::json!({"error":"control loop did not respond in time"}));
     }
 
     #[test]
@@ -528,8 +800,10 @@ mod tests {
     fn read_only_endpoints_remain_accessible_without_token() {
         let snapshot_value = serde_json::json!({
             "snapshot_epoch_secs": epoch_secs_now(),
+            "last_probe_cycle_mono": monotonic_secs_now(),
             "outbox_overflow": false,
             "shutting_down": false,
+            "degraded_reasons": [],
             "services": {}
         });
         let snapshot = snapshot_with(&snapshot_value);
@@ -539,6 +813,21 @@ mod tests {
 
         assert_eq!(health_status, tiny_http::StatusCode(200));
         assert_eq!(state_status, tiny_http::StatusCode(200));
+    }
+
+    #[test]
+    fn constant_time_eq_accepts_equal_inputs() {
+        assert!(constant_time_eq(b"secret-token", b"secret-token"));
+    }
+
+    #[test]
+    fn constant_time_eq_rejects_different_inputs() {
+        assert!(!constant_time_eq(b"secret-token", b"secret-tokfn"));
+    }
+
+    #[test]
+    fn constant_time_eq_rejects_different_lengths() {
+        assert!(!constant_time_eq(b"secret-token", b"secret"));
     }
 
     #[test]
@@ -593,5 +882,14 @@ mod tests {
         assert!(data.is_object());
         assert!(!data.is_array());
         assert_eq!(data["snapshot_epoch_secs"], 123);
+    }
+
+    #[test]
+    fn diagnose_unknown_service_returns_404() {
+        let (status, data) =
+            read_json(handle_diagnose("/api/v1/diagnose/not-configured", &known_services()));
+
+        assert_eq!(status, tiny_http::StatusCode(404));
+        assert_eq!(data, serde_json::json!({"error":"unknown service: not-configured"}));
     }
 }
