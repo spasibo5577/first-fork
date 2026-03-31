@@ -74,7 +74,7 @@ sudo chmod 600 /etc/craton/config.toml
 - список `[[service]]`
 - `service.unit`, `service.kind`, `service.probe`
 
-Актуальный пример лежит в [config.example.toml](/a:/cratond/config.example.toml).
+Актуальный пример лежит в [config.example.toml](config.example.toml).
 
 ### 4. Запустить демон
 
@@ -172,7 +172,7 @@ cratonctl trigger recovery
 cratonctl trigger backup
 ```
 
-Подробности: [docs/cratonctl.md](/a:/cratond/docs/cratonctl.md).
+Подробности: [docs/cratonctl.md](docs/cratonctl.md).
 
 ### Что `cratonctl` не делает
 
@@ -222,11 +222,11 @@ timeout_secs = 5
 expect_status = 200
 ```
 
-Для реального деплоя ориентируйся на [config.example.toml](/a:/cratond/config.example.toml).
+Для реального деплоя ориентируйся на [config.example.toml](config.example.toml).
 
 ## Systemd unit
 
-Готовый unit: [deploy/cratond.service](/a:/cratond/deploy/cratond.service).
+Готовый unit: [deploy/cratond.service](deploy/cratond.service).
 
 Текущий unit использует:
 
@@ -237,7 +237,7 @@ expect_status = 200
 - `RuntimeDirectory=craton`
 - `LogsDirectory=craton`
 
-Подробный деплой: [docs/deploy.md](/a:/cratond/docs/deploy.md).
+Подробный деплой: [docs/deploy.md](docs/deploy.md).
 
 ## HTTP API overview
 
@@ -374,11 +374,13 @@ cratonctl doctor
 - `cratonctl` не имеет watch mode в текущем коде
 - `cratonctl` не поддерживает `https://` и работает только через daemon HTTP API
 - поля `[ai]` в конфиге существуют, но это не означает готовую ZeroClaw integration
-- архитектурный источник истины остаётся в `CONSTITUTION.md`
+- архитектурный источник истины остаётся в `docs/architecture/CONSTITUTION.md`
 
 ## Дополнительные документы
 
-- [docs/cratonctl.md](/a:/cratond/docs/cratonctl.md)
-- [docs/deploy.md](/a:/cratond/docs/deploy.md)
-- [CRATONCTL_DESIGN.md](/a:/cratond/CRATONCTL_DESIGN.md)
-- [HANDOFF_FOR_CRATONCTL.md](/a:/cratond/HANDOFF_FOR_CRATONCTL.md)
+- [docs/cratonctl.md](docs/cratonctl.md)
+- [docs/deploy.md](docs/deploy.md)
+- [docs/design/CRATONCTL_DESIGN.md](docs/design/CRATONCTL_DESIGN.md)
+- [docs/handoffs/HANDOFF_FOR_CRATONCTL.md](docs/handoffs/HANDOFF_FOR_CRATONCTL.md)
+
+

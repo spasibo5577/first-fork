@@ -89,7 +89,7 @@ sudo install -m 0644 /tmp/cratond.service /etc/systemd/system/cratond.service
 
 Актуальный unit в репозитории:
 
-- [deploy/cratond.service](/a:/cratond/deploy/cratond.service)
+- [deploy/cratond.service](../deploy/cratond.service)
 
 Ключевые параметры текущего unit:
 
@@ -140,6 +140,7 @@ curl -s http://127.0.0.1:18800/api/v1/state | python3 -m json.tool
 
 ```bash
 cratonctl health
+cratonctl auth status
 cratonctl status
 cratonctl services
 cratonctl doctor
@@ -157,6 +158,7 @@ ls -l /var/lib/craton/remediation-token
 Если нужно проверить доступность mutating path под текущим пользователем:
 
 ```bash
+cratonctl auth status
 cratonctl doctor
 ```
 
@@ -251,8 +253,12 @@ cratonctl health
 Начни с:
 
 ```bash
+cratonctl auth status
 cratonctl doctor
 ```
+
+`auth status` покажет, какой token path реально проверяет CLI и почему mutating commands недоступны.
+`doctor` дополнит это общей проверкой daemon reachability и API preconditions.
 
 ### `/health` даёт 503
 
@@ -263,3 +269,4 @@ cratonctl doctor
 - `shutting_down`
 
 Это typed сигнал о состоянии control plane демона, а не обязательно о состоянии всех сервисов.
+

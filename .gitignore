@@ -1,1 +1,5 @@
 /target
+AGENTS.md
+strict_tmp/
+target_audit*/
+target_strict_*/
