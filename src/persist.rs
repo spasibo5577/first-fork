@@ -16,6 +16,14 @@ use std::path::Path;
 /// # Errors
 /// Returns an error if any filesystem operation fails.
 pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), PersistError> {
+    atomic_write_with(path, data, fsync_dir)
+}
+
+fn atomic_write_with(
+    path: &Path,
+    data: &[u8],
+    fsync_dir_fn: fn(&Path) -> Result<(), std::io::Error>,
+) -> Result<(), PersistError> {
     let dir = path
         .parent()
         .ok_or_else(|| PersistError::NoParentDir(path.to_path_buf()))?;
@@ -54,12 +62,10 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), PersistError> {
         source: e,
     })?;
 
-    if let Err(e) = fsync_dir(dir) {
-        eprintln!(
-            "warning: fsync directory {} failed (non-fatal): {e}",
-            dir.display(),
-        );
-    }
+    fsync_dir_fn(dir).map_err(|e| PersistError::FsyncDir {
+        path: dir.to_path_buf(),
+        source: e,
+    })?;
 
     Ok(())
 }
@@ -118,6 +124,10 @@ pub enum PersistError {
         path: std::path::PathBuf,
         source: std::io::Error,
     },
+    FsyncDir {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
     Rename {
         from: std::path::PathBuf,
         to: std::path::PathBuf,
@@ -142,6 +152,9 @@ impl std::fmt::Display for PersistError {
             }
             Self::Write { path, source } => write!(f, "writing to {}: {source}", path.display()),
             Self::Fsync { path, source } => write!(f, "fsync {}: {source}", path.display()),
+            Self::FsyncDir { path, source } => {
+                write!(f, "fsync directory {}: {source}", path.display())
+            }
             Self::Rename { from, to, source } => {
                 write!(
                     f,
@@ -162,6 +175,7 @@ impl std::error::Error for PersistError {
             | Self::CreateTemp { source, .. }
             | Self::Write { source, .. }
             | Self::Fsync { source, .. }
+            | Self::FsyncDir { source, .. }
             | Self::Rename { source, .. }
             | Self::Read { source, .. } => Some(source),
             Self::NoParentDir(_) | Self::NoFileName(_) => None,
@@ -219,6 +233,26 @@ mod tests {
 
         let result = read_optional(&path).expect("should read");
         assert_eq!(result, Some(b"hello".to_vec()));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_write_propagates_directory_fsync_failure() {
+        let dir = std::env::temp_dir().join("craton_test_persist_dir_fsync");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create test dir");
+
+        let path = dir.join("test_state.json");
+        let err = atomic_write_with(&path, b"{}", |_dir| {
+            Err(std::io::Error::other("dir fsync failed"))
+        })
+        .expect_err("dir fsync failure must propagate");
+
+        match err {
+            PersistError::FsyncDir { path: err_path, .. } => assert_eq!(err_path, dir),
+            other => panic!("unexpected error: {other}"),
+        }
 
         let _ = fs::remove_dir_all(&dir);
     }
