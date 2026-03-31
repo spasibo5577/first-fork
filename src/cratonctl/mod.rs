@@ -30,6 +30,7 @@ fn run_cli(parsed: &cli::Cli) -> Result<i32, CratonctlError> {
 
     match &parsed.command {
         cli::Command::Help { .. } => unreachable!("help commands return before client setup"),
+        cli::Command::AuthStatus => handle_auth_status(&resolved, &parsed.global),
         cli::Command::Health => handle_health(&client, &parsed.global),
         cli::Command::Status => handle_status(&client, &parsed.global),
         cli::Command::Services => handle_services(&client, &parsed.global),
@@ -113,6 +114,21 @@ fn handle_health(
         || output::render_health_quiet(&health),
     )?;
     Ok(i32::from(!health.is_ok()))
+}
+
+fn handle_auth_status(
+    resolved: &auth::ResolvedConfig,
+    global: &cli::GlobalArgs,
+) -> Result<i32, CratonctlError> {
+    let report = auth::auth_status(global, resolved);
+    let presentation = auth_presentation(global);
+    render(
+        &report,
+        global,
+        || output::render_auth_status(&report, presentation),
+        || output::render_auth_status_quiet(&report),
+    )?;
+    Ok(0)
 }
 
 fn handle_status(
@@ -255,7 +271,7 @@ fn handle_doctor(
     let read_only_ready = checks_read_only_ready(&checks) && state_result.is_ok();
     let mutating_ready = auth::require_token(resolved).is_ok();
     checks.push(read_only_check(read_only_ready));
-    checks.push(mutating_check(mutating_ready));
+    checks.push(mutating_check(resolved));
 
     let report = dto::DoctorReport {
         url: resolved.url.clone(),
@@ -344,19 +360,19 @@ fn read_only_check(read_only_ready: bool) -> dto::DoctorCheck {
     }
 }
 
-fn mutating_check(mutating_ready: bool) -> dto::DoctorCheck {
-    dto::DoctorCheck {
-        name: "mutating commands".into(),
-        status: if mutating_ready { "ok" } else { "warn" }.into(),
-        code: if mutating_ready {
-            "mutating_ready".into()
-        } else {
-            "mutating_not_ready".into()
+fn mutating_check(resolved: &auth::ResolvedConfig) -> dto::DoctorCheck {
+    match auth::require_token(resolved) {
+        Ok(_) => dto::DoctorCheck {
+            name: "mutating commands".into(),
+            status: "ok".into(),
+            code: "mutating_ready".into(),
+            detail: "token looks usable for mutating commands".into(),
         },
-        detail: if mutating_ready {
-            "token looks usable for mutating commands".into()
-        } else {
-            "mutating commands are not currently ready".into()
+        Err(error) => dto::DoctorCheck {
+            name: "mutating commands".into(),
+            status: "warn".into(),
+            code: "mutating_not_ready".into(),
+            detail: error.message(),
         },
     }
 }
@@ -519,10 +535,50 @@ fn help_presentation(global: &cli::GlobalArgs) -> output::Presentation {
     }
 }
 
+fn auth_presentation(global: &cli::GlobalArgs) -> output::Presentation {
+    output::Presentation {
+        use_color: use_color(global),
+        show_banner: show_banner(global),
+    }
+}
+
 fn use_color(global: &cli::GlobalArgs) -> bool {
     !global.json && !global.no_color && std::io::stdout().is_terminal()
 }
 
 fn show_banner(global: &cli::GlobalArgs) -> bool {
     !global.json && !global.quiet && std::io::stdout().is_terminal()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mutating_check_reports_auth_reason_when_token_file_is_missing() {
+        let resolved = auth::resolve(&cli::GlobalArgs {
+            token_file: Some("missing-token-for-doctor-test".into()),
+            ..cli::GlobalArgs::default()
+        })
+        .unwrap_or_else(|err| panic!("unexpected resolve error: {err}"));
+
+        let check = mutating_check(&resolved);
+        assert_eq!(check.status, "warn");
+        assert_eq!(check.code, "mutating_not_ready");
+        assert!(check.detail.contains("token file not found"));
+    }
+
+    #[test]
+    fn mutating_check_reports_ready_when_inline_token_is_present() {
+        let resolved = auth::resolve(&cli::GlobalArgs {
+            token: Some("inline-token".into()),
+            ..cli::GlobalArgs::default()
+        })
+        .unwrap_or_else(|err| panic!("unexpected resolve error: {err}"));
+
+        let check = mutating_check(&resolved);
+        assert_eq!(check.status, "ok");
+        assert_eq!(check.code, "mutating_ready");
+        assert_eq!(check.detail, "token looks usable for mutating commands");
+    }
 }

@@ -19,6 +19,14 @@ pub struct StateSnapshot {
     pub services: BTreeMap<String, ServiceStatusDto>,
     pub backup_phase: BackupPhaseDto,
     pub disk_usage_percent: Option<u32>,
+    #[serde(default)]
+    pub notify_degraded: bool,
+    #[serde(default)]
+    pub notify_consecutive_failures: u32,
+    #[serde(default)]
+    pub notify_last_success_epoch_secs: Option<u64>,
+    #[serde(default)]
+    pub notify_last_failure_epoch_secs: Option<u64>,
     pub shutting_down: bool,
     pub backup_history: Vec<BackupRecordDto>,
     pub recovery_history: Vec<RecoveryRecordDto>,
@@ -175,6 +183,8 @@ pub struct StatusSummary {
     pub disk_usage_percent: Option<u32>,
     pub shutting_down: bool,
     pub outbox_overflow: bool,
+    pub notify_degraded: bool,
+    pub notify_consecutive_failures: u32,
     pub snapshot_epoch_secs: u64,
     pub last_recovery_mono: Option<u64>,
 }
@@ -202,6 +212,8 @@ impl StatusSummary {
             disk_usage_percent: state.disk_usage_percent,
             shutting_down: state.shutting_down,
             outbox_overflow: state.outbox_overflow,
+            notify_degraded: state.notify_degraded,
+            notify_consecutive_failures: state.notify_consecutive_failures,
             snapshot_epoch_secs: state.snapshot_epoch_secs,
             last_recovery_mono: state.last_recovery_mono,
         }

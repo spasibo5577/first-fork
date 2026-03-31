@@ -1,5 +1,6 @@
 use crate::cratonctl::cli::GlobalArgs;
 use crate::cratonctl::error::{AuthError, CratonctlError};
+use serde::Serialize;
 use std::io;
 
 pub const DEFAULT_URL: &str = "http://127.0.0.1:18800";
@@ -9,6 +10,7 @@ pub const DEFAULT_TOKEN_FILE: &str = "/var/lib/craton/remediation-token";
 pub struct ResolvedConfig {
     pub url: String,
     token: TokenResolution,
+    selected_source: SelectedSource,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,12 +20,41 @@ pub struct TokenDiagnostic {
     pub detail: String,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AuthStatusReport {
+    pub url: String,
+    pub resolution_order: Vec<String>,
+    pub autodiscovery_token_path: String,
+    pub selected_source: String,
+    pub token_file_path: String,
+    pub token_file_status: String,
+    pub token_file_detail: String,
+    pub mutating_available: bool,
+    pub explanation: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TokenResolution {
     Available(String),
     FileMissing { path: String, explicit: bool },
     FileUnreadable { path: String, message: String },
     FileInvalid { path: String, reason: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectedSource {
+    Flag,
+    Env,
+    TokenFile,
+    Autodiscovery,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FileInspection {
+    Available,
+    Missing,
+    Unreadable { message: String },
+    Invalid { reason: String },
 }
 
 pub fn resolve(global: &GlobalArgs) -> Result<ResolvedConfig, CratonctlError> {
@@ -56,20 +87,31 @@ where
         )));
     }
 
-    let token = if let Some(token) = normalize_inline_token(global.token.clone()) {
-        TokenResolution::Available(token)
+    let (token, selected_source) = if let Some(token) = normalize_inline_token(global.token.clone()) {
+        (TokenResolution::Available(token), SelectedSource::Flag)
     } else if let Some(token) = normalize_inline_token(token_env) {
-        TokenResolution::Available(token)
+        (TokenResolution::Available(token), SelectedSource::Env)
     } else {
         let explicit = global.token_file.is_some();
         let token_file = global
             .token_file
             .as_deref()
             .unwrap_or(DEFAULT_TOKEN_FILE);
-        read_token_file(token_file, explicit, read_file)
+        (
+            read_token_file(token_file, explicit, read_file),
+            if explicit {
+                SelectedSource::TokenFile
+            } else {
+                SelectedSource::Autodiscovery
+            },
+        )
     };
 
-    Ok(ResolvedConfig { url, token })
+    Ok(ResolvedConfig {
+        url,
+        token,
+        selected_source,
+    })
 }
 
 pub fn require_token(resolved: &ResolvedConfig) -> Result<&str, CratonctlError> {
@@ -113,29 +155,50 @@ fn read_token_file<F>(path: &str, explicit: bool, read_file: &F) -> TokenResolut
 where
     F: Fn(&str) -> io::Result<String>,
 {
+    match inspect_token_file(path, read_file) {
+        FileInspection::Available => {
+            let token = read_file(path)
+                .ok()
+                .map(|content| content.trim().to_string())
+                .unwrap_or_default();
+            TokenResolution::Available(token)
+        }
+        FileInspection::Missing => TokenResolution::FileMissing {
+            path: path.into(),
+            explicit,
+        },
+        FileInspection::Unreadable { message } => TokenResolution::FileUnreadable {
+            path: path.into(),
+            message,
+        },
+        FileInspection::Invalid { reason } => TokenResolution::FileInvalid {
+            path: path.into(),
+            reason,
+        },
+    }
+}
+
+fn inspect_token_file<F>(path: &str, read_file: &F) -> FileInspection
+where
+    F: Fn(&str) -> io::Result<String>,
+{
     match read_file(path) {
         Ok(content) => {
             let trimmed = content.trim();
             if trimmed.is_empty() {
-                TokenResolution::FileInvalid {
-                    path: path.into(),
+                FileInspection::Invalid {
                     reason: "file is empty".into(),
                 }
             } else if !is_valid_token(trimmed) {
-                TokenResolution::FileInvalid {
-                    path: path.into(),
+                FileInspection::Invalid {
                     reason: "file contains whitespace".into(),
                 }
             } else {
-                TokenResolution::Available(trimmed.into())
+                FileInspection::Available
             }
         }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => TokenResolution::FileMissing {
-            path: path.into(),
-            explicit,
-        },
-        Err(err) => TokenResolution::FileUnreadable {
-            path: path.into(),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => FileInspection::Missing,
+        Err(err) => FileInspection::Unreadable {
             message: err.to_string(),
         },
     }
@@ -177,6 +240,78 @@ pub fn diagnose_token(resolved: &ResolvedConfig) -> TokenDiagnostic {
             code: "token_file_invalid",
             detail: format!("token file is invalid: {path} ({reason})"),
         },
+    }
+}
+
+pub fn auth_status(global: &GlobalArgs, resolved: &ResolvedConfig) -> AuthStatusReport {
+    auth_status_with(global, resolved, &|path| std::fs::read_to_string(path))
+}
+
+fn auth_status_with<F>(
+    global: &GlobalArgs,
+    resolved: &ResolvedConfig,
+    read_file: &F,
+) -> AuthStatusReport
+where
+    F: Fn(&str) -> io::Result<String>,
+{
+    let token_file_path = global
+        .token_file
+        .clone()
+        .unwrap_or_else(|| DEFAULT_TOKEN_FILE.into());
+    let file_inspection = inspect_token_file(&token_file_path, read_file);
+
+    let (token_file_status, token_file_detail) = match &file_inspection {
+        FileInspection::Available => ("readable".into(), "token file looks readable".into()),
+        FileInspection::Missing => ("missing".into(), format!("token file not found: {token_file_path}")),
+        FileInspection::Unreadable { message } => (
+            "unreadable".into(),
+            format!("token file is not readable: {token_file_path} ({message})"),
+        ),
+        FileInspection::Invalid { reason } => (
+            "invalid".into(),
+            format!("token file is invalid: {token_file_path} ({reason})"),
+        ),
+    };
+
+    let explanation = match (&resolved.selected_source, require_token(resolved)) {
+        (SelectedSource::Flag, Ok(_)) => "mutating commands are available via --token".into(),
+        (SelectedSource::Env, Ok(_)) => "mutating commands are available via CRATONCTL_TOKEN".into(),
+        (SelectedSource::TokenFile, Ok(_)) => {
+            format!("mutating commands are available via --token-file ({token_file_path})")
+        }
+        (SelectedSource::Autodiscovery, Ok(_)) => {
+            format!("mutating commands are available via autodiscovery ({DEFAULT_TOKEN_FILE})")
+        }
+        (_, Err(error)) => error.message(),
+    };
+
+    AuthStatusReport {
+        url: resolved.url.clone(),
+        resolution_order: vec![
+            "--token".into(),
+            "CRATONCTL_TOKEN".into(),
+            "--token-file".into(),
+            DEFAULT_TOKEN_FILE.into(),
+        ],
+        autodiscovery_token_path: DEFAULT_TOKEN_FILE.into(),
+        selected_source: resolved.selected_source.label().into(),
+        token_file_path,
+        token_file_status,
+        token_file_detail,
+        mutating_available: require_token(resolved).is_ok(),
+        explanation,
+    }
+}
+
+impl SelectedSource {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Flag => "--token",
+            Self::Env => "CRATONCTL_TOKEN",
+            Self::TokenFile => "--token-file",
+            Self::Autodiscovery => "autodiscovery",
+        }
     }
 }
 
@@ -362,5 +497,47 @@ mod tests {
             require_token(&resolved),
             Err(CratonctlError::Auth(AuthError::FileInvalid { .. }))
         ));
+    }
+
+    #[test]
+    fn auth_status_reports_inline_token_without_leaking_it() {
+        let global = GlobalArgs {
+            token: Some("flag-token".into()),
+            ..GlobalArgs::default()
+        };
+        let resolved = resolve_with(
+            &global,
+            None,
+            None,
+            &|_| Err(io::Error::new(io::ErrorKind::NotFound, "missing")),
+        )
+        .unwrap_or_else(|err| panic!("unexpected error: {err}"));
+        let report = auth_status_with(&global, &resolved, &|_| {
+            Err(io::Error::new(io::ErrorKind::NotFound, "missing"))
+        });
+        assert_eq!(report.selected_source, "--token");
+        assert!(report.mutating_available);
+        assert!(!report.explanation.contains("flag-token"));
+    }
+
+    #[test]
+    fn auth_status_reports_unreadable_file() {
+        let global = GlobalArgs {
+            token_file: Some("secret.token".into()),
+            ..GlobalArgs::default()
+        };
+        let resolved = resolve_with(
+            &global,
+            None,
+            None,
+            &|_| Err(io::Error::new(io::ErrorKind::PermissionDenied, "permission denied")),
+        )
+        .unwrap_or_else(|err| panic!("unexpected error: {err}"));
+        let report = auth_status_with(&global, &resolved, &|_| {
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, "permission denied"))
+        });
+        assert_eq!(report.selected_source, "--token-file");
+        assert_eq!(report.token_file_status, "unreadable");
+        assert!(!report.mutating_available);
     }
 }

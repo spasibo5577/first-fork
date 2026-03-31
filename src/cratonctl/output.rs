@@ -1,9 +1,14 @@
+use crate::cratonctl::auth::AuthStatusReport;
 use crate::cratonctl::dto::{
     BackupRecordDto, CommandResult, DiagnoseResponse, DoctorReport, HealthResponse,
     RecoveryRecordDto, RemediationRecordDto, ServiceDetail, ServiceSummary, StatusSummary,
 };
 
 const BANNER: &str = " ██████╗██████╗  █████╗ ████████╗ ██████╗ ███╗   ██╗\n██╔════╝██╔══██╗██╔══██╗╚══██╔══╝██╔═══██╗████╗  ██║\n██║     ██████╔╝███████║   ██║   ██║   ██║██╔██╗ ██║\n██║     ██╔══██╗██╔══██║   ██║   ██║   ██║██║╚██╗██║\n╚██████╗██║  ██║██║  ██║   ██║   ╚██████╔╝██║ ╚████║\n ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═══╝";
+const BANNER_SIGNATURE: &str = "crafted by cherry";
+const CHERRY_ACCENT: &str = "38;2;184;58;84";
+const CHERRY_ACCENT_BOLD: &str = "1;38;2;184;58;84";
+const CHERRY_SOFT: &str = "38;2;133;54;75";
 
 #[derive(Debug, Clone, Copy)]
 pub struct Presentation {
@@ -25,6 +30,50 @@ pub fn render_health_quiet(health: &HealthResponse) -> String {
     } else {
         format!("unavailable: {}", health.reason)
     }
+}
+
+pub fn render_auth_status(report: &AuthStatusReport, presentation: Presentation) -> String {
+    let mut out = Vec::new();
+    if presentation.show_banner {
+        out.extend(render_banner(presentation));
+        out.push(String::new());
+        out.push(paint_section("auth readiness:", presentation));
+    }
+
+    out.extend([
+        format!("url: {}", paint_meta(&report.url, presentation)),
+        format!(
+            "resolution: {}",
+            paint_meta(&report.resolution_order.join(" -> "), presentation)
+        ),
+        format!(
+            "autodiscovery_path: {}",
+            paint_meta(&report.autodiscovery_token_path, presentation)
+        ),
+        format!("selected_source: {}", paint_meta(&report.selected_source, presentation)),
+        format!("token_file: {} ({})", report.token_file_path, report.token_file_status),
+        format!("detail: {}", report.token_file_detail),
+        format!(
+            "mutating_available: {}",
+            if report.mutating_available {
+                paint_ok("yes", presentation)
+            } else {
+                paint_warn("no", presentation)
+            }
+        ),
+        format!("explanation: {}", report.explanation),
+    ]);
+
+    out.join("\n")
+}
+
+pub fn render_auth_status_quiet(report: &AuthStatusReport) -> String {
+    format!(
+        "source={} mutating={} token_file={}",
+        report.selected_source,
+        if report.mutating_available { "yes" } else { "no" },
+        report.token_file_status
+    )
 }
 
 pub fn render_status(status: &StatusSummary, presentation: Presentation) -> String {
@@ -50,6 +99,10 @@ pub fn render_status(status: &StatusSummary, presentation: Presentation) -> Stri
         format!("states: {}", paint_meta(&state_counts, presentation)),
         format!("backup: {}", paint_meta(&status.backup_phase, presentation)),
         format!("disk: {}", paint_meta(&disk, presentation)),
+        format!(
+            "notifications: {}",
+            render_notify_summary(status, presentation)
+        ),
     ];
 
     if status.shutting_down {
@@ -60,6 +113,22 @@ pub fn render_status(status: &StatusSummary, presentation: Presentation) -> Stri
     }
 
     lines.join("\n")
+}
+
+fn render_notify_summary(status: &StatusSummary, presentation: Presentation) -> String {
+    if status.notify_degraded {
+        if status.notify_consecutive_failures > 0 {
+            format!(
+                "{} ({} failures)",
+                paint_warn("degraded", presentation),
+                status.notify_consecutive_failures
+            )
+        } else {
+            paint_warn("degraded", presentation)
+        }
+    } else {
+        paint_ok("healthy", presentation)
+    }
 }
 
 pub fn render_status_quiet(status: &StatusSummary) -> String {
@@ -299,7 +368,7 @@ pub fn render_doctor(report: &DoctorReport, presentation: Presentation) -> Strin
         .collect::<Vec<_>>();
     let mut out = Vec::new();
     if presentation.show_banner {
-        out.push(BANNER.into());
+        out.extend(render_banner(presentation));
     }
     out.push(format!("url: {}", paint_meta(&report.url, presentation)));
     out.push(render_table(&["STATE", "CHECK", "DETAIL"], &rows));
@@ -343,7 +412,7 @@ pub fn render_doctor_quiet(report: &DoctorReport) -> String {
 pub fn render_help(usage: &str, presentation: Presentation) -> String {
     let mut out = Vec::new();
     if presentation.show_banner {
-        out.push(BANNER.into());
+        out.extend(render_banner(presentation));
         out.push(String::new());
     }
 
@@ -454,6 +523,7 @@ fn doctor_advice(report: &DoctorReport) -> Vec<String> {
         .any(|check| check.code == "token_not_provided")
     {
         advice.push("mutating commands need --token, CRATONCTL_TOKEN, or a readable token file".into());
+        advice.push("run `cratonctl auth status` for a detailed auth resolution report".into());
     }
     if report
         .checks
@@ -461,20 +531,23 @@ fn doctor_advice(report: &DoctorReport) -> Vec<String> {
         .any(|check| check.code == "token_file_missing")
     {
         advice.push("pass --token-file explicitly or install the remediation token at /var/lib/craton/remediation-token".into());
+        advice.push("run `cratonctl auth status` to confirm which token path the CLI is checking".into());
     }
     if report
         .checks
         .iter()
         .any(|check| check.code == "token_file_unreadable")
     {
-        advice.push("fix token file permissions or run as a user that can read the token file".into());
+        advice.push("fix token file permissions, use a readable --token-file, or provide the token via --token / CRATONCTL_TOKEN".into());
+        advice.push("run `cratonctl auth status` to see the exact token file path and read error".into());
     }
     if report
         .checks
         .iter()
         .any(|check| check.code == "token_file_invalid")
     {
-        advice.push("replace the token file with a single non-empty token line".into());
+        advice.push("replace the token file with a single non-empty token line, or override it with --token / CRATONCTL_TOKEN".into());
+        advice.push("run `cratonctl auth status` to confirm which token path is being inspected".into());
     }
     if advice.is_empty() && report.read_only_ready && report.mutating_ready {
         advice.push("no obvious operator-facing issues detected".into());
@@ -501,7 +574,7 @@ fn paint_check_status(status: &str, presentation: Presentation) -> String {
 }
 
 fn paint_section(text: &str, presentation: Presentation) -> String {
-    paint(text, "36;1", presentation)
+    paint(text, CHERRY_ACCENT_BOLD, presentation)
 }
 
 fn paint_ok(text: &str, presentation: Presentation) -> String {
@@ -520,12 +593,27 @@ fn paint_meta(text: &str, presentation: Presentation) -> String {
     paint(text, "2", presentation)
 }
 
+fn paint_cherry_soft(text: &str, presentation: Presentation) -> String {
+    paint(text, CHERRY_SOFT, presentation)
+}
+
+fn paint_banner(text: &str, presentation: Presentation) -> String {
+    paint(text, CHERRY_ACCENT, presentation)
+}
+
 fn paint(text: &str, code: &str, presentation: Presentation) -> String {
     if presentation.use_color {
         format!("\u{1b}[{code}m{text}\u{1b}[0m")
     } else {
         text.into()
     }
+}
+
+fn render_banner(presentation: Presentation) -> Vec<String> {
+    vec![
+        paint_banner(BANNER, presentation),
+        paint_cherry_soft(BANNER_SIGNATURE, presentation),
+    ]
 }
 
 fn pad_display(value: &str, width: usize) -> String {
@@ -571,6 +659,60 @@ mod tests {
             reason: "ok".into(),
         };
         assert_eq!(render_health(&health, PLAIN), "ok");
+    }
+
+    #[test]
+    fn auth_status_renderer_stays_secret_free() {
+        let report = AuthStatusReport {
+            url: "http://127.0.0.1:18800".into(),
+            resolution_order: vec![
+                "--token".into(),
+                "CRATONCTL_TOKEN".into(),
+                "--token-file".into(),
+                "/var/lib/craton/remediation-token".into(),
+            ],
+            autodiscovery_token_path: "/var/lib/craton/remediation-token".into(),
+            selected_source: "--token".into(),
+            token_file_path: "/var/lib/craton/remediation-token".into(),
+            token_file_status: "missing".into(),
+            token_file_detail: "token file not found".into(),
+            mutating_available: true,
+            explanation: "mutating commands are available via --token".into(),
+        };
+
+        let rendered = render_auth_status(&report, PLAIN);
+        assert!(rendered.contains("selected_source:"));
+        assert!(!rendered.contains("flag-token"));
+    }
+
+    #[test]
+    fn auth_status_renderer_can_show_banner_for_onboarding_paths() {
+        let report = AuthStatusReport {
+            url: "http://127.0.0.1:18800".into(),
+            resolution_order: vec![
+                "--token".into(),
+                "CRATONCTL_TOKEN".into(),
+                "--token-file".into(),
+                "/var/lib/craton/remediation-token".into(),
+            ],
+            autodiscovery_token_path: "/var/lib/craton/remediation-token".into(),
+            selected_source: "autodiscovery".into(),
+            token_file_path: "/var/lib/craton/remediation-token".into(),
+            token_file_status: "missing".into(),
+            token_file_detail: "token file not found".into(),
+            mutating_available: false,
+            explanation: "token required".into(),
+        };
+
+        let rendered = render_auth_status(
+            &report,
+            Presentation {
+                use_color: false,
+                show_banner: true,
+            },
+        );
+        assert!(rendered.contains("crafted by cherry"));
+        assert!(rendered.contains("auth readiness:"));
     }
 
     #[test]
@@ -627,6 +769,40 @@ mod tests {
     }
 
     #[test]
+    fn banner_renderer_includes_cherry_signature() {
+        let banner = render_banner(PLAIN).join("\n");
+        assert!(banner.contains("crafted by cherry"));
+        assert!(banner.contains("██████"));
+    }
+
+    #[test]
+    fn status_renderer_shows_notification_degradation_summary() {
+        let rendered = render_status(
+            &StatusSummary {
+                health: HealthResponse {
+                    status: "ok".into(),
+                    reason: "ok".into(),
+                },
+                service_count: 3,
+                degraded_count: 1,
+                state_counts: [("healthy".into(), 2), ("failed".into(), 1)]
+                    .into_iter()
+                    .collect(),
+                backup_phase: "idle".into(),
+                disk_usage_percent: Some(42),
+                shutting_down: false,
+                outbox_overflow: false,
+                notify_degraded: true,
+                notify_consecutive_failures: 3,
+                snapshot_epoch_secs: 0,
+                last_recovery_mono: None,
+            },
+            PLAIN,
+        );
+        assert!(rendered.contains("notifications: degraded (3 failures)"));
+    }
+
+    #[test]
     fn doctor_renderer_includes_actionable_advice() {
         let report = DoctorReport {
             url: "http://127.0.0.1:18800".into(),
@@ -652,5 +828,25 @@ mod tests {
         assert!(rendered.contains("advice:"));
         assert!(rendered.contains("check whether cratond is running"));
         assert!(rendered.contains("mutating commands need --token"));
+        assert!(rendered.contains("cratonctl auth status"));
+    }
+
+    #[test]
+    fn doctor_renderer_explains_permission_denied_auth_failures() {
+        let report = DoctorReport {
+            url: "http://127.0.0.1:18800".into(),
+            checks: vec![crate::cratonctl::dto::DoctorCheck {
+                name: "token access".into(),
+                status: "fail".into(),
+                code: "token_file_unreadable".into(),
+                detail: "permission denied".into(),
+            }],
+            read_only_ready: true,
+            mutating_ready: false,
+        };
+
+        let rendered = render_doctor(&report, PLAIN);
+        assert!(rendered.contains("--token / CRATONCTL_TOKEN"));
+        assert!(rendered.contains("exact token file path"));
     }
 }
