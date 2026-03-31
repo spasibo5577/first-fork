@@ -148,6 +148,7 @@ fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     // Notifier.
     let outbox_overflow = Arc::new(AtomicBool::new(false));
+    let notify_runtime_state = notify::NotifyRuntimeState::new();
     let notify_config = notify::NotifyConfig {
         ntfy_url: format!("{}/{}", cfg.ntfy.url, cfg.ntfy.topic),
         retries: cfg
@@ -160,6 +161,7 @@ fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
         queue_size: 64,
         outbox_path: "/var/lib/craton/alert-outbox.jsonl".into(),
         overflow_flag: outbox_overflow.clone(),
+        runtime_state: notify_runtime_state.clone(),
     };
     let (notif_sender, notif_consumer) = notify::create(notify_config);
 
@@ -189,6 +191,7 @@ fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
             notifier: notif_sender,
             sd_notify: &sd,
             outbox_overflow,
+            notify_runtime_state,
         },
         event_rx,
         event_tx,
