@@ -123,18 +123,14 @@ pub fn render_status(status: &StatusSummary, presentation: Presentation) -> Stri
 }
 
 fn render_notify_summary(status: &StatusSummary, presentation: Presentation) -> String {
-    if status.notify_degraded {
-        if status.notify_consecutive_failures > 0 {
-            format!(
-                "{} ({} consecutive failures)",
-                paint_warn("DEGRADED", presentation),
-                status.notify_consecutive_failures
-            )
-        } else {
-            paint_warn("DEGRADED", presentation)
-        }
+    if status.notify_consecutive_failures > 0 {
+        format!(
+            "{} ({} consecutive failures)",
+            paint_warn("DEGRADED", presentation),
+            status.notify_consecutive_failures
+        )
     } else {
-        paint_ok("OK", presentation)
+        paint_warn("DEGRADED", presentation)
     }
 }
 
@@ -356,14 +352,22 @@ pub fn render_diagnose_quiet(diagnose: &DiagnoseResponse) -> String {
 }
 
 pub fn render_command_result(result: &CommandResult, presentation: Presentation) -> String {
-    let accepted = paint_ok("accepted", presentation);
+    let status = paint_command_status(&result.status, presentation);
     match (&result.target, &result.detail) {
         (Some(target), Some(detail)) => {
-            format!("{accepted}: {} {} ({detail})", result.action, target)
+            format!("{status}: {} {} ({detail})", result.action, target)
         }
-        (Some(target), None) => format!("{accepted}: {} {}", result.action, target),
-        (None, Some(detail)) => format!("{accepted}: {} ({detail})", result.action),
-        (None, None) => format!("{accepted}: {}", result.action),
+        (Some(target), None) => format!("{status}: {} {}", result.action, target),
+        (None, Some(detail)) => format!("{status}: {} ({detail})", result.action),
+        (None, None) => format!("{status}: {}", result.action),
+    }
+}
+
+fn paint_command_status(status: &str, presentation: Presentation) -> String {
+    match status {
+        "completed" => paint_ok("completed", presentation),
+        "accepted" => paint_ok("accepted", presentation),
+        other => paint_meta(other, presentation),
     }
 }
 

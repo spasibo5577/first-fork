@@ -1,7 +1,7 @@
 use crate::cratonctl::error::CratonctlError;
 use serde::de::DeserializeOwned;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 const DEFAULT_HTTP_PORT: u16 = 80;
@@ -55,13 +55,6 @@ impl Client {
         Self::decode_json_response(path, response)
     }
 
-    pub fn post_json_no_auth<T>(&self, path: &str, body: &str) -> Result<T, CratonctlError>
-    where
-        T: DeserializeOwned,
-    {
-        let response = self.send_request("POST", path, Some(body), None)?;
-        Self::decode_json_response(path, response)
-    }
 
     fn decode_json_response<T>(path: &str, response: Response) -> Result<T, CratonctlError>
     where
@@ -71,11 +64,10 @@ impl Client {
             .map_err(|err| CratonctlError::Parse(format!("response body is not UTF-8: {err}")))?;
 
         if !(200..300).contains(&response.status) {
-            return Err(CratonctlError::Daemon(format!(
-                "HTTP {} for {}: {}",
-                response.status,
+            return Err(CratonctlError::Daemon(daemon_error_message(
                 path,
-                compact_body(&body_text)
+                response.status,
+                &body_text,
             )));
         }
 
@@ -92,7 +84,12 @@ impl Client {
         bearer_token: Option<&str>,
     ) -> Result<Response, CratonctlError> {
         let address = format!("{}:{}", self.endpoint.host, self.endpoint.port);
-        let mut stream = TcpStream::connect(&address)
+        let socket_addr = address
+            .to_socket_addrs()
+            .map_err(|err| CratonctlError::Transport(format!("resolve {address}: {err}")))?
+            .next()
+            .ok_or_else(|| CratonctlError::Transport(format!("resolve {address}: no socket addresses")))?;
+        let mut stream = TcpStream::connect_timeout(&socket_addr, Duration::from_secs(3))
             .map_err(|err| CratonctlError::Transport(format!("connect {address}: {err}")))?;
         let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
         let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
@@ -224,6 +221,21 @@ fn parse_http_response(raw: &[u8]) -> Result<Response, CratonctlError> {
     })
 }
 
+fn daemon_error_message(path: &str, status: u16, body_text: &str) -> String {
+    let error_detail = parse_error_body(body_text).unwrap_or_else(|| compact_body(body_text));
+    match status {
+        409 => format!("policy rejected request for {path}: {error_detail}"),
+        503 => format!("daemon control loop is unavailable for {path}: {error_detail}"),
+        504 => "daemon control loop did not respond in time".into(),
+        _ => format!("HTTP {status} for {path}: {error_detail}"),
+    }
+}
+
+fn parse_error_body(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    value.get("error")?.as_str().map(str::to_string)
+}
+
 fn compact_body(body: &str) -> String {
     let trimmed = body.trim();
     if trimmed.is_empty() {
@@ -268,7 +280,7 @@ mod tests {
     }
 
     #[test]
-    fn post_json_no_auth_omits_authorization_header() {
+    fn post_json_includes_authorization_header() {
         let listener = TcpListener::bind("127.0.0.1:0")
             .unwrap_or_else(|err| panic!("unexpected bind error: {err}"));
         let address = listener
@@ -285,7 +297,7 @@ mod tests {
                 .unwrap_or_else(|err| panic!("unexpected read error: {err}"));
             let request_text = String::from_utf8(request[..read].to_vec())
                 .unwrap_or_else(|err| panic!("unexpected utf8 error: {err}"));
-            assert!(!request_text.contains("Authorization: Bearer"));
+            assert!(request_text.contains("Authorization: Bearer test-token"));
             stream
                 .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 21\r\n\r\n{\"status\":\"accepted\"}")
                 .unwrap_or_else(|err| panic!("unexpected write error: {err}"));
@@ -293,7 +305,7 @@ mod tests {
 
         let client = Client::new(&format!("http://127.0.0.1:{}", address.port()));
         let response = client
-            .post_json_no_auth::<CommandAcceptedResponse>("/trigger/recovery", "{}")
+            .post_json::<CommandAcceptedResponse>("/trigger/recovery", "{}", "test-token")
             .unwrap_or_else(|err| panic!("unexpected client error: {err}"));
 
         assert_eq!(response.status, "accepted");
@@ -301,6 +313,54 @@ mod tests {
             .join()
             .unwrap_or_else(|_| panic!("unexpected server join failure"));
     }
+
+
+    #[test]
+    fn decode_json_response_reports_policy_rejection_reason() {
+        let error = Client::decode_json_response::<CommandAcceptedResponse>(
+            "/trigger/recovery",
+            Response {
+                status: 409,
+                body: br#"{"error":"lease conflict"}"#.to_vec(),
+            },
+        )
+        .err()
+        .unwrap_or_else(|| panic!("expected daemon error"));
+        assert_eq!(
+            error.message(),
+            "policy rejected request for /trigger/recovery: lease conflict"
+        );
+    }
+
+    #[test]
+    fn decode_json_response_reports_control_loop_timeout() {
+        let error = Client::decode_json_response::<CommandAcceptedResponse>(
+            "/api/v1/remediate",
+            Response {
+                status: 504,
+                body: br#"{"error":"timeout"}"#.to_vec(),
+            },
+        )
+        .err()
+        .unwrap_or_else(|| panic!("expected daemon error"));
+        assert_eq!(error.message(), "daemon control loop did not respond in time");
+    }
+
+    #[test]
+    fn decode_json_response_reports_control_loop_unavailable() {
+        let error = Client::decode_json_response::<CommandAcceptedResponse>(
+            "/api/v1/remediate",
+            Response {
+                status: 503,
+                body: br#"{"error":"control loop unavailable"}"#.to_vec(),
+            },
+        )
+        .err()
+        .unwrap_or_else(|| panic!("expected daemon error"));
+        assert_eq!(
+            error.message(),
+            "daemon control loop is unavailable for /api/v1/remediate: control loop unavailable"
+        );
+    }
+
 }
-
-

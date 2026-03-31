@@ -13,6 +13,7 @@ pub enum CratonctlError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthError {
     NotProvided,
+    InlineInvalid { source: &'static str },
     FileMissing { path: String },
     FileUnreadable { path: String, message: String },
     FileInvalid { path: String, reason: String },
@@ -45,6 +46,7 @@ impl CratonctlError {
             Self::Usage(_) => "usage_error",
             Self::Config(_) => "config_error",
             Self::Auth(AuthError::NotProvided) => "token_not_provided",
+            Self::Auth(AuthError::InlineInvalid { .. }) => "token_invalid",
             Self::Auth(AuthError::FileMissing { .. }) => "token_file_missing",
             Self::Auth(AuthError::FileUnreadable { .. }) => "token_file_unreadable",
             Self::Auth(AuthError::FileInvalid { .. }) => "token_file_invalid",
@@ -71,6 +73,9 @@ impl AuthError {
         match self {
             Self::NotProvided => {
                 "token required for mutating command; use --token, CRATONCTL_TOKEN, or --token-file".into()
+            }
+            Self::InlineInvalid { source } => {
+                format!("token provided via {source} is empty or whitespace")
             }
             Self::FileMissing { path } => format!("token file not found: {path}"),
             Self::FileUnreadable { path, message } => {

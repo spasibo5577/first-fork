@@ -35,7 +35,8 @@ pub struct StateSnapshot {
     pub remediation_history: Vec<RemediationRecordDto>,
     pub snapshot_epoch_secs: u64,
     pub last_recovery_mono: Option<u64>,
-    pub start_mono: u64,
+    #[serde(default)]
+    pub start_mono: Option<u64>,
     pub outbox_overflow: bool,
 }
 
@@ -97,7 +98,6 @@ impl ServiceStatusDto {
             Self::Unknown | Self::BlockedByDep { .. } | Self::Suppressed { .. } => None,
         }
     }
-
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,6 +172,8 @@ pub struct DiagnoseResponse {
 pub struct CommandAcceptedResponse {
     pub status: String,
     #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
     pub task: Option<String>,
 }
 
@@ -242,7 +244,8 @@ pub struct ServiceSummary {
 impl ServiceSummary {
     #[must_use]
     pub fn list_from_snapshot(state: StateSnapshot) -> Vec<Self> {
-        let mut services: Vec<Self> = state.services
+        let mut services: Vec<Self> = state
+            .services
             .into_iter()
             .map(|(id, status)| Self {
                 id,
@@ -323,5 +326,61 @@ fn state_rank(status: &str) -> u8 {
         "unknown" => 5,
         "healthy" => 6,
         _ => 7,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SNAPSHOT_WITH_START_MONO: &str = r#"{
+  "services": {},
+  "backup_phase": { "phase": "idle" },
+  "disk_usage_percent": null,
+  "startup_kind": "daemon_restart",
+  "notify_degraded": false,
+  "notify_consecutive_failures": 0,
+  "notify_last_success_epoch_secs": 0,
+  "notify_last_failure_epoch_secs": 0,
+  "shutting_down": false,
+  "backup_history": [],
+  "recovery_history": [],
+  "remediation_history": [],
+  "snapshot_epoch_secs": 123,
+  "last_recovery_mono": null,
+  "start_mono": 456,
+  "outbox_overflow": false
+}"#;
+
+    const SNAPSHOT_WITHOUT_START_MONO: &str = r#"{
+  "services": {},
+  "backup_phase": { "phase": "idle" },
+  "disk_usage_percent": null,
+  "startup_kind": "daemon_restart",
+  "notify_degraded": false,
+  "notify_consecutive_failures": 0,
+  "notify_last_success_epoch_secs": 0,
+  "notify_last_failure_epoch_secs": 0,
+  "shutting_down": false,
+  "backup_history": [],
+  "recovery_history": [],
+  "remediation_history": [],
+  "snapshot_epoch_secs": 123,
+  "last_recovery_mono": null,
+  "outbox_overflow": false
+}"#;
+
+    #[test]
+    fn snapshot_deserialization_accepts_present_start_mono() {
+        let snapshot: StateSnapshot = serde_json::from_str(SNAPSHOT_WITH_START_MONO)
+            .unwrap_or_else(|err| panic!("unexpected snapshot error: {err}"));
+        assert_eq!(snapshot.start_mono, Some(456));
+    }
+
+    #[test]
+    fn snapshot_deserialization_accepts_missing_start_mono() {
+        let snapshot: StateSnapshot = serde_json::from_str(SNAPSHOT_WITHOUT_START_MONO)
+            .unwrap_or_else(|err| panic!("unexpected snapshot error: {err}"));
+        assert_eq!(snapshot.start_mono, None);
     }
 }

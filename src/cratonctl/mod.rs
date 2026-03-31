@@ -3,6 +3,7 @@ pub mod cli;
 pub mod client;
 pub mod dto;
 pub mod error;
+pub mod init;
 pub mod output;
 
 use crate::cratonctl::error::CratonctlError;
@@ -24,12 +25,16 @@ fn run_cli(parsed: &cli::Cli) -> Result<i32, CratonctlError> {
     if let cli::Command::Help { text, top_level } = &parsed.command {
         return Ok(handle_help(&parsed.global, text, *top_level));
     }
+    if let cli::Command::Init(args) = &parsed.command {
+        return handle_init(args, &parsed.global);
+    }
 
     let resolved = auth::resolve(&parsed.global)?;
     let client = client::Client::new(&resolved.url);
 
     match &parsed.command {
         cli::Command::Help { .. } => unreachable!("help commands return before client setup"),
+        cli::Command::Init(_) => unreachable!("init commands return before client setup"),
         cli::Command::AuthStatus => handle_auth_status(&resolved, &parsed.global),
         cli::Command::Health => handle_health(&client, &parsed.global),
         cli::Command::Status => handle_status(&client, &parsed.global),
@@ -38,7 +43,7 @@ fn run_cli(parsed: &cli::Cli) -> Result<i32, CratonctlError> {
         cli::Command::History { kind } => handle_history(&client, &parsed.global, *kind),
         cli::Command::Diagnose { service } => handle_diagnose(&client, &parsed.global, service),
         cli::Command::Doctor => handle_doctor(&client, &resolved, &parsed.global),
-        cli::Command::Trigger { task } => handle_trigger(&client, &parsed.global, task),
+        cli::Command::Trigger { task } => handle_trigger(&client, &resolved, &parsed.global, task),
         cli::Command::Restart { service } => handle_remediation_command(&client, &resolved, &parsed.global, RemediationSpec {
             action: "RestartService",
             target: Some(service.as_str()),
@@ -81,7 +86,7 @@ fn run_cli(parsed: &cli::Cli) -> Result<i32, CratonctlError> {
             label: "flapping clear",
             display_target: Some(service.as_str()),
         }),
-        cli::Command::BackupRun => handle_trigger(&client, &parsed.global, "backup"),
+        cli::Command::BackupRun => handle_trigger(&client, &resolved, &parsed.global, "backup"),
         cli::Command::BackupUnlock => handle_remediation_command(&client, &resolved, &parsed.global, RemediationSpec {
             action: "ResticUnlock",
             target: None,
@@ -121,6 +126,17 @@ fn handle_health(
         || output::render_health_quiet(&health),
     )?;
     Ok(i32::from(!health.is_ok()))
+}
+
+fn handle_init(args: &init::InitArgs, global: &cli::GlobalArgs) -> Result<i32, CratonctlError> {
+    let report = init::run(args)?;
+    render(
+        &report,
+        global,
+        || init::render_human(&report),
+        || init::render_quiet(&report),
+    )?;
+    Ok(0)
 }
 
 fn handle_auth_status(
@@ -386,16 +402,18 @@ fn mutating_check(resolved: &auth::ResolvedConfig) -> dto::DoctorCheck {
 
 fn handle_trigger(
     client: &client::Client,
+    resolved: &auth::ResolvedConfig,
     global: &cli::GlobalArgs,
     task: &str,
 ) -> Result<i32, CratonctlError> {
+    let token = auth::require_token(resolved)?;
     let path = format!("/trigger/{}", client::path_segment(task));
-    let response = client.post_json_no_auth::<dto::CommandAcceptedResponse>(&path, "{}")?;
+    let response = client.post_json::<dto::CommandAcceptedResponse>(&path, "{}", token)?;
     let result = dto::CommandResult {
         action: "trigger".into(),
         status: response.status,
         target: response.task.or_else(|| Some(task.into())),
-        detail: None,
+        detail: response.detail,
     };
     let presentation = default_presentation(global);
     render(
@@ -464,7 +482,7 @@ fn remediate(
         action: label.into(),
         status: response.status,
         target: display_target.map(str::to_string),
-        detail: None,
+        detail: response.detail,
     })
 }
 
@@ -587,6 +605,8 @@ mod tests {
         assert_eq!(check.detail, "token looks usable for mutating commands");
     }
 }
+
+
 
 
 

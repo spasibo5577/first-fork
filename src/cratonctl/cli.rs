@@ -1,4 +1,5 @@
 use crate::cratonctl::error::CratonctlError;
+use crate::cratonctl::init;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -28,6 +29,7 @@ pub enum Command {
     History { kind: HistoryKind },
     Diagnose { service: String },
     Doctor,
+    Init(init::InitArgs),
     Trigger { task: String },
     Restart { service: String },
     DockerRestart { container: String },
@@ -161,18 +163,12 @@ enum RawCommand {
     Status,
     #[command(about = "List services and current state")]
     Services,
-    #[command(
-        about = "Show one service",
-        after_help = SERVICE_HELP
-    )]
+    #[command(about = "Show one service", after_help = SERVICE_HELP)]
     Service {
         #[arg(value_name = "id")]
         id: String,
     },
-    #[command(
-        about = "Show historical events",
-        after_help = HISTORY_HELP
-    )]
+    #[command(about = "Show historical events", after_help = HISTORY_HELP)]
     History {
         #[arg(value_enum, value_name = "kind")]
         kind: RawHistoryKind,
@@ -191,6 +187,19 @@ enum RawCommand {
         after_help = DOCTOR_HELP
     )]
     Doctor,
+    #[command(
+        about = "Bootstrap first-time server setup",
+        long_about = "Bootstrap first-time server setup by creating directories, a config template, a remediation token, and a systemd unit without starting the daemon.",
+        after_help = INIT_HELP
+    )]
+    Init {
+        #[arg(long = "non-interactive", help = "Write defaults without prompting")]
+        non_interactive: bool,
+        #[arg(long = "config-dir", value_name = "path", help = "Override config directory")]
+        config_dir: Option<String>,
+        #[arg(long = "state-dir", value_name = "path", help = "Override state directory")]
+        state_dir: Option<String>,
+    },
     #[command(
         about = "Trigger an existing daemon task",
         long_about = "Trigger an existing daemon task through POST /trigger/{task}.\nThe CLI stays thin here: the daemon remains the source of truth for which tasks are accepted.",
@@ -226,9 +235,19 @@ enum RawCommand {
         after_help = MAINTENANCE_HELP
     )]
     Maintenance(RawMaintenanceCommand),
-    #[command(subcommand, about = "Breaker operations")]
+    #[command(
+        subcommand,
+        about = "Breaker operations",
+        long_about = "Clear daemon-managed breaker state for a service through the remediation API.",
+        after_help = BREAKER_HELP
+    )]
     Breaker(RawClearCommand),
-    #[command(subcommand, about = "Flapping operations")]
+    #[command(
+        subcommand,
+        about = "Flapping operations",
+        long_about = "Clear daemon-managed flapping state for a service through the remediation API.",
+        after_help = FLAPPING_HELP
+    )]
     Flapping(RawClearCommand),
     #[command(
         subcommand,
@@ -237,7 +256,12 @@ enum RawCommand {
         after_help = BACKUP_HELP
     )]
     Backup(RawBackupCommand),
-    #[command(subcommand, about = "Disk operations")]
+    #[command(
+        subcommand,
+        about = "Disk operations",
+        long_about = "Disk-related operator commands routed through daemon remediation actions.",
+        after_help = DISK_HELP
+    )]
     Disk(RawDiskCommand),
 }
 
@@ -284,7 +308,7 @@ enum RawMaintenanceCommand {
 
 #[derive(Debug, Subcommand)]
 enum RawClearCommand {
-    #[command(about = "Clear state for a service")]
+    #[command(about = "Clear state for a service", after_help = CLEAR_HELP)]
     Clear {
         #[arg(value_name = "service")]
         service: String,
@@ -322,7 +346,11 @@ enum RawDockerCommand {
 
 #[derive(Debug, Subcommand)]
 enum RawDiskCommand {
-    #[command(about = "Run disk cleanup")]
+    #[command(
+        about = "Run disk cleanup",
+        long_about = "Request a daemon-side disk cleanup remediation action.",
+        after_help = DISK_CLEANUP_HELP
+    )]
     Cleanup,
 }
 
@@ -358,6 +386,15 @@ fn map_command(command: RawCommand) -> Result<Command, CratonctlError> {
         }),
         RawCommand::Diagnose { service } => Ok(Command::Diagnose { service }),
         RawCommand::Doctor => Ok(Command::Doctor),
+        RawCommand::Init {
+            non_interactive,
+            config_dir,
+            state_dir,
+        } => Ok(Command::Init(init::InitArgs {
+            non_interactive,
+            config_dir,
+            state_dir,
+        })),
         RawCommand::Trigger { task } => Ok(Command::Trigger { task }),
         RawCommand::Restart { service } => Ok(Command::Restart { service }),
         RawCommand::Docker(RawDockerCommand::Restart { container }) => {
@@ -386,28 +423,29 @@ fn map_command(command: RawCommand) -> Result<Command, CratonctlError> {
     }
 }
 
-const EXTRA_HELP: &str = "Read-only commands:\n  health\n  status\n  services\n  service <id>\n  history <recovery|backup|remediation>\n  diagnose <service>\n  doctor\n\nMutating commands:\n  trigger <task>\n  restart <service>\n  docker restart <container>\n  maintenance set <service> --reason <text>\n  maintenance clear <service>\n  breaker clear <service>\n  flapping clear <service>\n  backup run\n  backup unlock\n  disk cleanup\n\nAuth behavior:\n  Read-only commands do not require a token.\n  Mutating commands resolve token in this order:\n    1. --token\n    2. CRATONCTL_TOKEN\n    3. --token-file\n    4. /var/lib/craton/remediation-token\n\nExamples:\n  cratonctl status\n  cratonctl services\n  cratonctl service ntfy\n  cratonctl doctor\n  cratonctl restart ntfy --token-file /var/lib/craton/remediation-token\n  cratonctl maintenance set ntfy --reason \"manual work\"\n  cratonctl backup run --json --token \"$CRATONCTL_TOKEN\"";
+const EXTRA_HELP: &str = "Read-only commands:\n  health\n  status\n  services\n  service <id>\n  history <recovery|backup|remediation>\n  diagnose <service>\n  doctor\n\nSetup commands:\n  init [--non-interactive] [--config-dir <path>] [--state-dir <path>]\n\nMutating commands:\n  trigger <task>\n  restart <service>\n  docker restart <container>\n  maintenance set <service> --reason <text>\n  maintenance clear <service>\n  breaker clear <service>\n  flapping clear <service>\n  backup run\n  backup unlock\n  disk cleanup\n\nAuth behavior:\n  Read-only commands do not require a token.\n  Mutating commands resolve token in this order:\n    1. --token\n    2. CRATONCTL_TOKEN\n    3. --token-file\n    4. /var/lib/craton/remediation-token\n\nExamples:\n  cratonctl status\n  cratonctl services\n  cratonctl service ntfy\n  cratonctl doctor\n  cratonctl init --non-interactive\n  cratonctl restart ntfy --token-file /var/lib/craton/remediation-token\n  cratonctl maintenance set ntfy --reason \"manual work\"\n  cratonctl backup run --json --token \"$CRATONCTL_TOKEN\"";
 
 const SERVICE_HELP: &str = "Examples:\n  cratonctl service ntfy\n  cratonctl service api --json\n\nNotes:\n  This command reads the current daemon snapshot.\n  It shows a focused service view rather than a full state dump.";
 const HISTORY_HELP: &str = "Kinds:\n  recovery\n  backup\n  remediation\n\nExamples:\n  cratonctl history recovery\n  cratonctl history backup --json\n  cratonctl history remediation\n\nNotes:\n  This command reads daemon history endpoints directly.\n  Use --json for machine-readable postprocessing.";
 const DIAGNOSE_HELP: &str = "Examples:\n  cratonctl diagnose ntfy\n  cratonctl diagnose api --json\n\nNotes:\n  This command asks the daemon for systemd-side diagnostics.\n  It is read-only and may include recent journal excerpts.";
-const TRIGGER_HELP: &str = "Common task names:\n  recovery\n  backup\n  disk-monitor\n  apt-updates\n  docker-updates\n  daily-summary\n\nExamples:\n  cratonctl trigger recovery\n  cratonctl trigger backup\n  cratonctl trigger daily-summary\n\nNotes:\n  This command uses the daemon trigger path without requiring remediation auth.\n  The daemon remains the source of truth for accepted task names.";
+const TRIGGER_HELP: &str = "Common task names:\n  recovery\n  backup\n  disk-monitor\n  apt-updates\n  docker-updates\n  daily-summary\n\nExamples:\n  cratonctl trigger recovery\n  cratonctl trigger backup\n  cratonctl trigger daily-summary\n\nNotes:\n  This command uses the daemon trigger path and requires mutating auth.\n  The daemon remains the source of truth for accepted task names.";
 const RESTART_HELP: &str = "Examples:\n  cratonctl restart ntfy --token-file /var/lib/craton/remediation-token\n  cratonctl restart api --json --token \"$CRATONCTL_TOKEN\"\n\nNotes:\n  This command requires mutating auth.\n  The daemon applies restart policy and records remediation history.";
-
 const MAINTENANCE_HELP: &str = "Examples:\n  cratonctl maintenance set ntfy --reason \"manual investigation\"\n  cratonctl maintenance clear ntfy\n\nNotes:\n  Maintenance commands require mutating auth.\n  The CLI does not manage maintenance duration locally.";
 const MAINTENANCE_SET_HELP: &str = "Examples:\n  cratonctl maintenance set ntfy --reason \"manual investigation\"\n  cratonctl maintenance set api --reason \"planned restart\"\n\nNotes:\n  This command requires mutating auth.\n  The reason must be non-empty.";
 const MAINTENANCE_CLEAR_HELP: &str = "Examples:\n  cratonctl maintenance clear ntfy\n\nNotes:\n  This command requires mutating auth.";
-
-const BACKUP_HELP: &str = "Examples:\n  cratonctl backup run\n  cratonctl backup unlock --token \"$CRATONCTL_TOKEN\"\n\nNotes:\n  `run` goes through the daemon trigger path and does not require remediation auth.\n  `unlock` goes through remediation and still requires mutating auth.";
-const BACKUP_RUN_HELP: &str = "Examples:\n  cratonctl backup run\n  cratonctl backup run --json\n\nNotes:\n  This command uses the daemon trigger path and does not require remediation auth.\n  It does not touch backup state directly.";
+const BREAKER_HELP: &str = "Examples:\n  cratonctl breaker clear ntfy\n\nNotes:\n  Breaker commands require mutating auth.\n  The daemon decides whether the breaker can be cleared safely.";
+const FLAPPING_HELP: &str = "Examples:\n  cratonctl flapping clear ntfy\n\nNotes:\n  Flapping commands require mutating auth.\n  Use this after reviewing why the daemon marked the service as flapping.";
+const CLEAR_HELP: &str = "Examples:\n  cratonctl breaker clear ntfy --token-file /var/lib/craton/remediation-token\n  cratonctl flapping clear api --token \"$CRATONCTL_TOKEN\"\n\nNotes:\n  This command requires mutating auth.\n  It requests a daemon-side remediation action.";
+const BACKUP_HELP: &str = "Examples:\n  cratonctl backup run\n  cratonctl backup unlock --token \"$CRATONCTL_TOKEN\"\n\nNotes:\n  `run` goes through the daemon trigger path and requires mutating auth.\n  `unlock` goes through remediation and still requires mutating auth.";
+const BACKUP_RUN_HELP: &str = "Examples:\n  cratonctl backup run\n  cratonctl backup run --json\n\nNotes:\n  This command uses the daemon trigger path and requires mutating auth.\n  It does not touch backup state directly.";
 const BACKUP_UNLOCK_HELP: &str = "Examples:\n  cratonctl backup unlock --token-file /var/lib/craton/remediation-token\n  cratonctl backup unlock --token \"$CRATONCTL_TOKEN\"\n\nNotes:\n  This command requires mutating auth.\n  It requests a daemon-side remediation action.";
+const DISK_HELP: &str = "Examples:\n  cratonctl disk cleanup --token-file /var/lib/craton/remediation-token\n\nNotes:\n  Disk commands require mutating auth.\n  Cleanup is executed by the daemon, not directly by the CLI.";
+const DISK_CLEANUP_HELP: &str = "Examples:\n  cratonctl disk cleanup --token-file /var/lib/craton/remediation-token\n  cratonctl disk cleanup --json --token \"$CRATONCTL_TOKEN\"\n\nNotes:\n  This command requires mutating auth.\n  It requests the daemon's disk cleanup remediation action.";
 const DOCKER_HELP: &str = "Examples:\n  cratonctl docker restart redis --token-file /var/lib/craton/remediation-token\n\nNotes:\n  Docker commands require mutating auth.\n  They go through daemon remediation rather than talking to Docker directly.";
 const DOCKER_RESTART_HELP: &str = "Examples:\n  cratonctl docker restart redis --token-file /var/lib/craton/remediation-token\n  cratonctl docker restart postgres --token \"$CRATONCTL_TOKEN\"\n\nNotes:\n  This command requires mutating auth.\n  It sends the DockerRestart remediation action with reason \"operator\".";
-
 const DOCTOR_HELP: &str = "Checks:\n  daemon reachability\n  GET /health\n  GET /api/v1/state\n  token file accessibility\n  read-only and mutating readiness\n\nExamples:\n  cratonctl doctor\n  cratonctl --json doctor\n  cratonctl --url http://127.0.0.1:18800 doctor\n\nNotes:\n  `doctor` never sends mutating requests.\n  Use it as a safe preflight before restart/maintenance/backup actions.";
-
+const INIT_HELP: &str = "Examples:\n  cratonctl init\n  cratonctl init --non-interactive\n  cratonctl init --config-dir /tmp/craton/etc --state-dir /tmp/craton/state\n  cratonctl init --non-interactive --json\n\nNotes:\n  This command must be run as root.\n  It never starts or enables the daemon.\n  Existing config, token, and unit files are left untouched.";
 const AUTH_HELP: &str = "Commands:\n  status    show URL, token source resolution, token file status, and mutating readiness\n\nExamples:\n  cratonctl auth status\n  cratonctl auth status --token-file /var/lib/craton/remediation-token\n  cratonctl --json auth status\n\nNotes:\n  This command never prints the token itself.\n  Use it when mutating commands are unexpectedly unavailable.";
-
 const AUTH_STATUS_HELP: &str = "Report fields:\n  daemon URL\n  token resolution order\n  autodiscovery token path\n  token file existence/readability\n  mutating readiness and explanation\n\nExamples:\n  cratonctl auth status\n  cratonctl auth status --token-file /var/lib/craton/remediation-token\n  cratonctl auth status --token \"$CRATONCTL_TOKEN\"\n  cratonctl --json auth status\n\nNotes:\n  This is a read-only report.\n  The token value is never printed.";
 
 #[cfg(test)]
@@ -481,6 +519,7 @@ mod tests {
         let text = usage();
         assert!(text.contains("Global options:"));
         assert!(text.contains("Read-only commands:"));
+        assert!(text.contains("Setup commands:"));
         assert!(text.contains("Mutating commands:"));
         assert!(text.contains("Auth behavior:"));
         assert!(text.contains("Examples:"));
@@ -490,6 +529,52 @@ mod tests {
     fn parses_doctor_command() {
         let cli = parse_ok(&["cratonctl", "doctor"]);
         assert_eq!(cli.command, Command::Doctor);
+    }
+
+    #[test]
+    fn parses_init_command() {
+        let cli = parse_ok(&["cratonctl", "init"]);
+        assert_eq!(
+            cli.command,
+            Command::Init(init::InitArgs {
+                non_interactive: false,
+                config_dir: None,
+                state_dir: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_init_non_interactive_command() {
+        let cli = parse_ok(&["cratonctl", "init", "--non-interactive"]);
+        assert_eq!(
+            cli.command,
+            Command::Init(init::InitArgs {
+                non_interactive: true,
+                config_dir: None,
+                state_dir: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_init_with_path_overrides() {
+        let cli = parse_ok(&[
+            "cratonctl",
+            "init",
+            "--config-dir",
+            "/tmp/test",
+            "--state-dir",
+            "/tmp/test2",
+        ]);
+        assert_eq!(
+            cli.command,
+            Command::Init(init::InitArgs {
+                non_interactive: false,
+                config_dir: Some("/tmp/test".into()),
+                state_dir: Some("/tmp/test2".into()),
+            })
+        );
     }
 
     #[test]
@@ -533,6 +618,18 @@ mod tests {
     }
 
     #[test]
+    fn init_help_mentions_root_and_non_interactive() {
+        let cli = parse_ok(&["cratonctl", "init", "--help"]);
+        let Command::Help { text, top_level } = cli.command else {
+            panic!("expected help command");
+        };
+        assert!(!top_level);
+        assert!(text.contains("--non-interactive"));
+        assert!(text.contains("must be run as root"));
+        assert!(text.contains("never starts or enables the daemon"));
+    }
+
+    #[test]
     fn trigger_help_mentions_common_tasks() {
         let cli = parse_ok(&["cratonctl", "trigger", "--help"]);
         let Command::Help { text, top_level } = cli.command else {
@@ -546,7 +643,7 @@ mod tests {
         assert!(text.contains("apt-updates"));
         assert!(text.contains("docker-updates"));
         assert!(text.contains("daily-summary"));
-        assert!(!text.contains("requires mutating auth"));
+        assert!(text.contains("requires mutating auth"));
     }
 
     #[test]
@@ -647,7 +744,41 @@ mod tests {
             panic!("expected help command");
         };
         assert!(!top_level);
-        assert!(text.contains("does not require remediation auth"));
+        assert!(text.contains("requires mutating auth"));
         assert!(text.contains("daemon trigger path"));
     }
+
+    #[test]
+    fn breaker_help_mentions_examples_and_auth() {
+        let cli = parse_ok(&["cratonctl", "breaker", "--help"]);
+        let Command::Help { text, top_level } = cli.command else {
+            panic!("expected help command");
+        };
+        assert!(!top_level);
+        assert!(text.contains("cratonctl breaker clear ntfy"));
+        assert!(text.contains("require mutating auth"));
+    }
+
+    #[test]
+    fn flapping_help_mentions_review_context() {
+        let cli = parse_ok(&["cratonctl", "flapping", "--help"]);
+        let Command::Help { text, top_level } = cli.command else {
+            panic!("expected help command");
+        };
+        assert!(!top_level);
+        assert!(text.contains("cratonctl flapping clear ntfy"));
+        assert!(text.contains("marked the service as flapping"));
+    }
+
+    #[test]
+    fn disk_cleanup_help_mentions_daemon_side_action() {
+        let cli = parse_ok(&["cratonctl", "disk", "cleanup", "--help"]);
+        let Command::Help { text, top_level } = cli.command else {
+            panic!("expected help command");
+        };
+        assert!(!top_level);
+        assert!(text.contains("cratonctl disk cleanup --token-file"));
+        assert!(text.contains("daemon's disk cleanup remediation action"));
+    }
 }
+

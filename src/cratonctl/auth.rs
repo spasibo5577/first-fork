@@ -51,7 +51,7 @@ enum SelectedSource {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FileInspection {
-    Available,
+    Available { token: String },
     Missing,
     Unreadable { message: String },
     Invalid { reason: String },
@@ -87,9 +87,11 @@ where
         )));
     }
 
-    let (token, selected_source) = if let Some(token) = normalize_inline_token(global.token.clone()) {
+    let (token, selected_source) = if let Some(token) =
+        normalize_inline_token(global.token.clone(), "--token")?
+    {
         (TokenResolution::Available(token), SelectedSource::Flag)
-    } else if let Some(token) = normalize_inline_token(token_env) {
+    } else if let Some(token) = normalize_inline_token(token_env, "CRATONCTL_TOKEN")? {
         (TokenResolution::Available(token), SelectedSource::Env)
     } else {
         let explicit = global.token_file.is_some();
@@ -141,13 +143,18 @@ pub fn require_token(resolved: &ResolvedConfig) -> Result<&str, CratonctlError> 
     }
 }
 
-fn normalize_inline_token(value: Option<String>) -> Option<String> {
-    let value = value?;
+fn normalize_inline_token(
+    value: Option<String>,
+    source: &'static str,
+) -> Result<Option<String>, CratonctlError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
     let trimmed = value.trim();
     if is_valid_token(trimmed) {
-        Some(trimmed.into())
+        Ok(Some(trimmed.into()))
     } else {
-        None
+        Err(CratonctlError::Auth(AuthError::InlineInvalid { source }))
     }
 }
 
@@ -156,13 +163,7 @@ where
     F: Fn(&str) -> io::Result<String>,
 {
     match inspect_token_file(path, read_file) {
-        FileInspection::Available => {
-            let token = read_file(path)
-                .ok()
-                .map(|content| content.trim().to_string())
-                .unwrap_or_default();
-            TokenResolution::Available(token)
-        }
+        FileInspection::Available { token } => TokenResolution::Available(token),
         FileInspection::Missing => TokenResolution::FileMissing {
             path: path.into(),
             explicit,
@@ -194,7 +195,9 @@ where
                     reason: "file contains whitespace".into(),
                 }
             } else {
-                FileInspection::Available
+                FileInspection::Available {
+                    token: trimmed.to_string(),
+                }
             }
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => FileInspection::Missing,
@@ -262,7 +265,9 @@ where
     let file_inspection = inspect_token_file(&token_file_path, read_file);
 
     let (token_file_status, token_file_detail) = match &file_inspection {
-        FileInspection::Available => ("readable".into(), "token file looks readable".into()),
+        FileInspection::Available { .. } => {
+            ("readable".into(), "token file looks readable".into())
+        }
         FileInspection::Missing => ("missing".into(), format!("token file not found: {token_file_path}")),
         FileInspection::Unreadable { message } => (
             "unreadable".into(),
@@ -382,6 +387,29 @@ mod tests {
     }
 
     #[test]
+    fn resolve_reports_empty_flag_token_explicitly() {
+        let global = GlobalArgs {
+            token: Some("   ".into()),
+            ..GlobalArgs::default()
+        };
+        assert!(matches!(
+            resolve_with(&global, None, None, &|_| Ok("file-token".into())),
+            Err(CratonctlError::Auth(AuthError::InlineInvalid { source: "--token" }))
+        ));
+    }
+
+    #[test]
+    fn resolve_reports_empty_env_token_explicitly() {
+        let global = GlobalArgs::default();
+        assert!(matches!(
+            resolve_with(&global, None, Some(" \n ".into()), &|_| Ok("file-token".into())),
+            Err(CratonctlError::Auth(AuthError::InlineInvalid {
+                source: "CRATONCTL_TOKEN"
+            }))
+        ));
+    }
+
+    #[test]
     fn resolve_prefers_env_token_over_file() {
         let global = GlobalArgs {
             token_file: Some("custom.token".into()),
@@ -497,6 +525,25 @@ mod tests {
             require_token(&resolved),
             Err(CratonctlError::Auth(AuthError::FileInvalid { .. }))
         ));
+    }
+
+    #[test]
+    fn token_file_is_read_once() {
+        let global = GlobalArgs {
+            token_file: Some("single-read.token".into()),
+            ..GlobalArgs::default()
+        };
+        let reads = std::cell::Cell::new(0usize);
+        let resolved = resolve_with(&global, None, None, &|_| {
+            reads.set(reads.get() + 1);
+            Ok("file-token".into())
+        })
+        .unwrap_or_else(|err| panic!("unexpected error: {err}"));
+        assert_eq!(reads.get(), 1);
+        match require_token(&resolved) {
+            Ok(token) => assert_eq!(token, "file-token"),
+            Err(err) => panic!("unexpected error: {err}"),
+        }
     }
 
     #[test]
