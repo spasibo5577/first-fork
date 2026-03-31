@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
@@ -39,6 +39,84 @@ pub struct NotifyConfig {
     /// Set to `true` when an undelivered alert is evicted due to overflow.
     /// Shared with the control loop for snapshot publication.
     pub overflow_flag: Arc<AtomicBool>,
+    /// Shared delivery-health state for operator observability.
+    pub runtime_state: NotifyRuntimeState,
+}
+
+/// Shared runtime health for the notification channel.
+#[derive(Debug, Clone)]
+pub struct NotifyRuntimeState {
+    degraded: Arc<AtomicBool>,
+    consecutive_failures: Arc<AtomicU64>,
+    last_success_epoch_secs: Arc<AtomicU64>,
+    last_failure_epoch_secs: Arc<AtomicU64>,
+}
+
+impl NotifyRuntimeState {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            degraded: Arc::new(AtomicBool::new(false)),
+            consecutive_failures: Arc::new(AtomicU64::new(0)),
+            last_success_epoch_secs: Arc::new(AtomicU64::new(0)),
+            last_failure_epoch_secs: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    pub fn record_delivery_success(&self) {
+        let previous_failures = self.consecutive_failures.swap(0, Ordering::Relaxed);
+        let was_degraded = self.degraded.swap(false, Ordering::Relaxed);
+        self.last_success_epoch_secs
+            .store(epoch_secs_now(), Ordering::Relaxed);
+
+        if was_degraded {
+            crate::log::info(
+                "notify",
+                &format!(
+                    "notification channel recovered after {previous_failures} consecutive failure(s)"
+                ),
+            );
+        }
+    }
+
+    pub fn record_delivery_failure(&self) {
+        let current = self
+            .consecutive_failures
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        let already_degraded = self.degraded.swap(true, Ordering::Relaxed);
+        self.last_failure_epoch_secs
+            .store(epoch_secs_now(), Ordering::Relaxed);
+
+        if !already_degraded {
+            crate::log::error(
+                "notify",
+                &format!(
+                    "notification channel degraded: first failed delivery in current streak (count={current})"
+                ),
+            );
+        }
+    }
+
+    #[must_use]
+    pub fn degraded(&self) -> bool {
+        self.degraded.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn consecutive_failures(&self) -> u64 {
+        self.consecutive_failures.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn last_success_epoch_secs(&self) -> u64 {
+        self.last_success_epoch_secs.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn last_failure_epoch_secs(&self) -> u64 {
+        self.last_failure_epoch_secs.load(Ordering::Relaxed)
+    }
 }
 
 /// Handle for queueing notifications. Clone-able, thread-safe.
@@ -120,6 +198,7 @@ impl NotifyConsumer {
                 if send_ntfy(&self.config.ntfy_url, &entry.alert).is_ok() {
                     delivered = true;
                     dedup.record(entry.id.clone());
+                    self.config.runtime_state.record_delivery_success();
                     break;
                 }
             }
@@ -128,6 +207,7 @@ impl NotifyConsumer {
                 sent_count += 1;
             } else {
                 failed_count += 1;
+                self.config.runtime_state.record_delivery_failure();
                 crate::log::warn(
                     "notify",
                     &format!("replay delivery failed for '{}', will retry next start", entry.alert.title),
@@ -178,13 +258,19 @@ impl NotifyConsumer {
                         delivered = true;
                         sent_count += 1;
                         dedup.record(key.clone());
+                        self.config.runtime_state.record_delivery_success();
                         break;
                     }
                     Err(e) => {
-                        crate::log::warn(
-                            "notify",
-                            &format!("NTFY delivery failed (attempt {}): {e}", attempt + 1),
-                        );
+                        if attempt + 1 == self.config.retries.len() {
+                            crate::log::warn(
+                                "notify",
+                                &format!(
+                                    "NTFY delivery exhausted retries ({} attempt(s)): {e}",
+                                    attempt + 1
+                                ),
+                            );
+                        }
                     }
                 }
             }
@@ -194,6 +280,7 @@ impl NotifyConsumer {
                 outbox.persist(&outbox_path);
             } else {
                 failed_count += 1;
+                self.config.runtime_state.record_delivery_failure();
                 crate::log::error(
                     "notify",
                     &format!(
@@ -541,9 +628,30 @@ mod tests {
             queue_size: 8,
             outbox_path: "/tmp/test-outbox.jsonl".into(),
             overflow_flag: Arc::new(AtomicBool::new(false)),
+            runtime_state: NotifyRuntimeState::new(),
         };
         let (sender, _consumer) = create(config);
         sender.queue(make_alert("hello"));
+    }
+
+    #[test]
+    fn runtime_state_marks_degraded_and_recovers() {
+        let state = NotifyRuntimeState::new();
+        assert!(!state.degraded());
+        assert_eq!(state.consecutive_failures(), 0);
+
+        state.record_delivery_failure();
+        assert!(state.degraded());
+        assert_eq!(state.consecutive_failures(), 1);
+        assert!(state.last_failure_epoch_secs() > 0);
+
+        state.record_delivery_failure();
+        assert_eq!(state.consecutive_failures(), 2);
+
+        state.record_delivery_success();
+        assert!(!state.degraded());
+        assert_eq!(state.consecutive_failures(), 0);
+        assert!(state.last_success_epoch_secs() > 0);
     }
 
     #[test]

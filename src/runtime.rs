@@ -12,7 +12,7 @@ use crate::model::{
     Alert, AlertPriority, BackupPhase, CleanupLevel, Command, EffectResult, Event, ProbeResult,
     ServiceId, TaskKind,
 };
-use crate::notify::NotifySender;
+use crate::notify::{NotifyRuntimeState, NotifySender};
 use crate::reduce::{self, Ctx};
 use crate::schedule::{self, Schedule, WallClock};
 use crate::state::State;
@@ -28,6 +28,7 @@ pub struct RuntimeDeps<'a> {
     pub notifier: NotifySender,
     pub sd_notify: &'a crate::effect::systemd::SdNotify,
     pub outbox_overflow: Arc<AtomicBool>,
+    pub notify_runtime_state: NotifyRuntimeState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +54,7 @@ pub fn run_control_loop(
         notifier,
         sd_notify,
         outbox_overflow,
+        notify_runtime_state,
     } = deps;
     let mono_start = monotonic_secs();
     let mut state = State::new(config, mono_start);
@@ -124,7 +126,13 @@ pub fn run_control_loop(
         }
 
         // Publish snapshot every loop iteration so heartbeat stays fresh.
-        publish_snapshot(&state, &snapshot, &outbox_overflow);
+        publish_snapshot(
+            &state,
+            startup_kind,
+            &snapshot,
+            &outbox_overflow,
+            &notify_runtime_state,
+        );
 
         match event_rx.recv_timeout(Duration::from_secs(1)) {
             Ok(event) => {
@@ -155,7 +163,13 @@ pub fn run_control_loop(
 
     crate::log::info("runtime", "control loop exiting");
     sd_notify.status("shutting down");
-    publish_snapshot(&state, &snapshot, &outbox_overflow);
+    publish_snapshot(
+        &state,
+        startup_kind,
+        &snapshot,
+        &outbox_overflow,
+        &notify_runtime_state,
+    );
 }
 
 // ─── Command execution ────────────────────────────────────────
@@ -461,7 +475,12 @@ fn exec_restic_unlock(config: &CratonConfig) {
 }
 
 fn exec_update_llm_context(state: &State, config: &CratonConfig) {
-    let snap = build_snapshot_json(state, &Arc::new(AtomicBool::new(false)));
+    let snap = build_snapshot_json(
+        state,
+        StartupKind::Unknown,
+        &Arc::new(AtomicBool::new(false)),
+        &NotifyRuntimeState::new(),
+    );
     if let Err(e) = crate::persist::atomic_write(
         std::path::Path::new(&config.ai.context_path),
         snap.as_bytes(),
@@ -488,14 +507,25 @@ fn run_probes(service_ids: &[ServiceId], config: &CratonConfig) -> Vec<ProbeResu
 
 // ─── Snapshot ──────────────────────────────────────────────────
 
-fn publish_snapshot(state: &State, snapshot: &SharedSnapshot, outbox_overflow: &Arc<AtomicBool>) {
-    let json = build_snapshot_json(state, outbox_overflow);
+fn publish_snapshot(
+    state: &State,
+    startup_kind: StartupKind,
+    snapshot: &SharedSnapshot,
+    outbox_overflow: &Arc<AtomicBool>,
+    notify_runtime_state: &NotifyRuntimeState,
+) {
+    let json = build_snapshot_json(state, startup_kind, outbox_overflow, notify_runtime_state);
     if let Ok(mut s) = snapshot.lock() {
         *s = json;
     }
 }
 
-fn build_snapshot_json(state: &State, outbox_overflow: &Arc<AtomicBool>) -> String {
+fn build_snapshot_json(
+    state: &State,
+    startup_kind: StartupKind,
+    outbox_overflow: &Arc<AtomicBool>,
+    notify_runtime_state: &NotifyRuntimeState,
+) -> String {
     let mut services = serde_json::Map::new();
     for (id, svc) in &state.services {
         let status_json = serde_json::to_value(&svc.status).unwrap_or_default();
@@ -513,7 +543,12 @@ fn build_snapshot_json(state: &State, outbox_overflow: &Arc<AtomicBool>) -> Stri
         "snapshot_epoch_secs": epoch_secs_now(),
         "last_recovery_mono": state.last_recovery_mono,
         "start_mono": state.start_mono,
+        "startup_kind": startup_kind.label(),
         "outbox_overflow": outbox_overflow.load(Ordering::Relaxed),
+        "notify_degraded": notify_runtime_state.degraded(),
+        "notify_consecutive_failures": notify_runtime_state.consecutive_failures(),
+        "notify_last_success_epoch_secs": notify_runtime_state.last_success_epoch_secs(),
+        "notify_last_failure_epoch_secs": notify_runtime_state.last_failure_epoch_secs(),
     })
     .to_string()
 }
@@ -784,10 +819,10 @@ impl StartupKind {
 
     const fn alert_body(self) -> &'static str {
         match self {
-            Self::FirstStart => "Первый запуск или отсутствует сохранённый boot id.",
-            Self::DaemonRestart => "Перезапуск демона в рамках текущей загрузки хоста.",
+            Self::FirstStart => "Первый запуск демона или отсутствует сохранённая boot-сессия.",
+            Self::DaemonRestart => "Демон перезапущен без новой загрузки хоста.",
             Self::HostBoot => "Обнаружена новая загрузка хоста.",
-            Self::Unknown => "Не удалось надёжно определить тип запуска.",
+            Self::Unknown => "Тип запуска определить не удалось.",
         }
     }
 }
@@ -895,5 +930,45 @@ mod tests {
         assert_eq!(third, StartupKind::HostBoot);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_includes_notification_runtime_fields() {
+        let config = crate::config::CratonConfig::from_toml(
+            r#"
+[ntfy]
+url = "http://127.0.0.1:8080"
+topic = "alerts"
+
+[backup]
+restic_repo = "/tmp/repo"
+restic_password_file = "/tmp/pass"
+
+[[service]]
+id = "ntfy"
+name = "NTFY"
+unit = "ntfy.service"
+kind = "systemd"
+
+[service.probe]
+type = "http"
+url = "http://127.0.0.1:8080/v1/health"
+"#,
+        )
+        .unwrap_or_else(|e| panic!("config parse failed: {e}"));
+        let state = State::new(&config, 1);
+        let outbox = Arc::new(AtomicBool::new(true));
+        let notify_state = NotifyRuntimeState::new();
+        notify_state.record_delivery_failure();
+
+        let snap = build_snapshot_json(&state, StartupKind::HostBoot, &outbox, &notify_state);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&snap).unwrap_or_else(|e| panic!("snapshot parse failed: {e}"));
+
+        assert_eq!(parsed["outbox_overflow"], true);
+        assert_eq!(parsed["startup_kind"], "host_boot");
+        assert_eq!(parsed["notify_degraded"], true);
+        assert_eq!(parsed["notify_consecutive_failures"], 1);
+        assert!(parsed["notify_last_failure_epoch_secs"].as_u64().unwrap_or(0) > 0);
     }
 }
