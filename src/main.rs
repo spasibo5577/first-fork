@@ -37,17 +37,22 @@ use std::time::Duration;
 ///
 /// Token is a hex-encoded SHA-256 digest seeded from PID + time.
 /// Written atomically to `token_path` so it survives daemon restarts.
-fn load_or_create_token(token_path: &str) -> String {
+fn load_or_create_token(token_path: &str) -> Result<String, String> {
     let path = std::path::Path::new(token_path);
 
     // Try to read existing token.
-    if let Ok(Some(data)) = persist::read_optional(path) {
-        if let Ok(s) = String::from_utf8(data) {
+    match persist::read_optional(path) {
+        Ok(Some(data)) => {
+            let s = String::from_utf8(data)
+                .map_err(|e| format!("remediation token {token_path} is not valid UTF-8: {e}"))?;
             let s = s.trim().to_string();
-            if !s.is_empty() {
-                return s;
+            if s.is_empty() {
+                return Err(format!("remediation token {token_path} is empty"));
             }
+            return Ok(s);
         }
+        Ok(None) => {}
+        Err(e) => return Err(format!("reading remediation token {token_path}: {e}")),
     }
 
     // Generate new token: SHA-256(pid || now_nanos || salt).
@@ -63,13 +68,19 @@ fn load_or_create_token(token_path: &str) -> String {
     hasher.update(b"cratond-remediation-token-v1");
     let token = format!("{:x}", hasher.finalize());
 
-    if let Err(e) = persist::atomic_write(path, token.as_bytes()) {
-        crate::log::warn("startup", &format!("failed to persist remediation token: {e}"));
-    } else {
-        crate::log::info("startup", "remediation token persisted");
-    }
+    persist::atomic_write(path, token.as_bytes())
+        .map_err(|e| format!("persisting remediation token to {token_path}: {e}"))?;
+    crate::log::info("startup", "remediation token persisted");
 
-    token
+    Ok(token)
+}
+
+fn ensure_runtime_dirs(paths: &[&str]) -> Result<(), String> {
+    for dir in paths {
+        let path = std::path::Path::new(dir);
+        std::fs::create_dir_all(path).map_err(|e| format!("creating runtime dir {dir}: {e}"))?;
+    }
+    Ok(())
 }
 
 fn main() {
@@ -112,14 +123,7 @@ fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // ── Phase 3: Create directories ──
-    for dir in &["/var/lib/craton", "/run/craton"] {
-        let path = std::path::Path::new(dir);
-        if !path.exists() {
-            if let Err(e) = std::fs::create_dir_all(path) {
-                crate::log::warn("startup", &format!("cannot create {dir}: {e}"));
-            }
-        }
-    }
+    ensure_runtime_dirs(&["/var/lib/craton", "/run/craton"])?;
 
     // ── Phase 4: Initialize subsystems ──
     let sd = effect::systemd::SdNotify::from_env();
@@ -141,7 +145,7 @@ fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             })
-            .ok();
+            .map_err(|e| format!("spawning signal adapter thread: {e}"))?;
 
         signal::spawn_signal_thread(sig_tx)?;
     }
@@ -174,7 +178,7 @@ fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     // HTTP API.
     let snapshot = http::empty_snapshot();
-    let remediation_token = load_or_create_token(&cfg.ai.token_path);
+    let remediation_token = load_or_create_token(&cfg.ai.token_path)?;
     http::spawn_http_thread(
         &cfg.daemon.listen,
         snapshot.clone(),
@@ -198,4 +202,49 @@ fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ensure_runtime_dirs_fails_when_path_is_blocked_by_file() {
+        let dir = std::env::temp_dir().join(format!("craton_startup_dirs_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("create test dir: {e}"));
+
+        let file_path = dir.join("blocked");
+        std::fs::write(&file_path, b"not a directory")
+            .unwrap_or_else(|e| panic!("write blocking file: {e}"));
+
+        let result = ensure_runtime_dirs(&[
+            file_path
+                .to_str()
+                .unwrap_or_else(|| panic!("temp path should be valid UTF-8")),
+        ]);
+        assert!(result.is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_or_create_token_rejects_invalid_utf8_existing_file() {
+        let dir = std::env::temp_dir().join(format!("craton_token_invalid_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("create test dir: {e}"));
+
+        let token_path = dir.join("remediation-token");
+        std::fs::write(&token_path, [0xff, 0xfe, 0xfd])
+            .unwrap_or_else(|e| panic!("write invalid token: {e}"));
+
+        let result = load_or_create_token(
+            token_path
+                .to_str()
+                .unwrap_or_else(|| panic!("temp path should be valid UTF-8")),
+        );
+        assert!(result.is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
