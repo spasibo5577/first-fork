@@ -11,9 +11,6 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 pub struct DepGraph {
     /// service → services it depends on (parents).
     parents: BTreeMap<ServiceId, Vec<ServiceId>>,
-    /// service → services that depend on it (children).
-    #[allow(dead_code)] // Phase 4: cascade notifications to dependents
-    children: BTreeMap<ServiceId, Vec<ServiceId>>,
     all_ids: Vec<ServiceId>,
     topo_order: Vec<ServiceId>,
 }
@@ -26,7 +23,6 @@ impl DepGraph {
     /// or references an undefined service.
     pub fn build(services: &[crate::config::ServiceEntry]) -> Result<Self, GraphError> {
         let mut parents: BTreeMap<ServiceId, Vec<ServiceId>> = BTreeMap::new();
-        let mut children: BTreeMap<ServiceId, Vec<ServiceId>> = BTreeMap::new();
         let mut all_ids = Vec::with_capacity(services.len());
 
         let known: BTreeSet<ServiceId> = services.iter().map(|s| s.id.clone()).collect();
@@ -34,8 +30,6 @@ impl DepGraph {
         for svc in services {
             all_ids.push(svc.id.clone());
             parents.entry(svc.id.clone()).or_default();
-            children.entry(svc.id.clone()).or_default();
-
             for dep in &svc.depends_on {
                 if !known.contains(dep) {
                     return Err(GraphError::UnknownDependency {
@@ -49,7 +43,6 @@ impl DepGraph {
                     });
                 }
                 parents.entry(svc.id.clone()).or_default().push(dep.clone());
-                children.entry(dep.clone()).or_default().push(svc.id.clone());
             }
         }
 
@@ -57,7 +50,6 @@ impl DepGraph {
 
         Ok(Self {
             parents,
-            children,
             all_ids,
             topo_order,
         })
@@ -73,13 +65,6 @@ impl DepGraph {
     #[must_use]
     pub fn dependencies_of(&self, id: &ServiceId) -> &[ServiceId] {
         self.parents.get(id).map_or(&[], Vec::as_slice)
-    }
-
-    /// Services that directly depend on this one (children).
-    #[allow(dead_code)] // Phase 4: cascade notifications
-    #[must_use]
-    pub fn dependents_of(&self, id: &ServiceId) -> &[ServiceId] {
-        self.children.get(id).map_or(&[], Vec::as_slice)
     }
 
     /// Given unhealthy services, separates root causes from blocked dependents.

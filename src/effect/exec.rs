@@ -111,7 +111,7 @@ pub fn run_dry_aware(
     dry_run: bool,
 ) -> Result<ExecResult, ExecError> {
     if dry_run && !is_read_only(argv) {
-        eprintln!("DRY-RUN: would execute: {}", argv.join(" "));
+        crate::log::raw(&format!("DRY-RUN: would execute: {}", argv.join(" ")));
         return Ok(ExecResult {
             stdout: Vec::new(),
             stderr: Vec::new(),

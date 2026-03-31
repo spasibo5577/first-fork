@@ -52,9 +52,15 @@ impl<T> RingBuf<T> {
     }
 }
 
-/// Collection utility methods — standard API, used in tests,
-/// consumed by Phase 4 runtime (history endpoints, diagnostics).
-#[allow(dead_code)]
+impl<T> RingBuf<T> {
+    /// Clears all items.
+    pub fn clear(&mut self) {
+        self.items.clear();
+    }
+}
+
+/// Collection utility methods used only in tests.
+#[cfg(test)]
 impl<T> RingBuf<T> {
     /// Number of items currently stored.
     #[must_use]
@@ -79,11 +85,6 @@ impl<T> RingBuf<T> {
     pub fn last_n(&self, n: usize) -> Vec<&T> {
         let skip = self.items.len().saturating_sub(n);
         self.items.iter().skip(skip).collect()
-    }
-
-    /// Clears all items.
-    pub fn clear(&mut self) {
-        self.items.clear();
     }
 
     /// Sets max size after deserialization. Truncates if needed.

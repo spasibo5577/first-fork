@@ -6,6 +6,10 @@ fn emit(level: &str, subsystem: &str, message: &str) {
     eprintln!("[cratond][{level}][{subsystem}] {message}");
 }
 
+pub fn raw(message: &str) {
+    eprintln!("{message}");
+}
+
 pub fn info(subsystem: &str, message: &str) {
     emit("INFO", subsystem, message);
 }

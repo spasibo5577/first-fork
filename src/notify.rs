@@ -221,10 +221,10 @@ impl NotifyConsumer {
         // ── Main delivery loop ────────────────────────────────
         loop {
             let Ok(alert) = self.rx.recv() else {
-                eprintln!(
+                crate::log::raw(&format!(
                     "[cratond] notifier stopped: sent={sent_count} \
                      failed={failed_count} dedup={dedup_count}"
-                );
+                ));
                 return;
             };
 
@@ -313,7 +313,10 @@ impl Outbox {
                 }
             }
             Err(e) => {
-                eprintln!("[cratond] failed to read outbox {}: {e}", path.display());
+                crate::log::raw(&format!(
+                    "[cratond] failed to read outbox {}: {e}",
+                    path.display()
+                ));
                 return Self {
                     entries: Vec::new(),
                 };
@@ -327,7 +330,7 @@ impl Outbox {
             .filter_map(|line| match serde_json::from_str::<OutboxEntry>(line) {
                 Ok(e) => Some(e),
                 Err(e) => {
-                    eprintln!("[cratond] outbox: skipping corrupt entry: {e}");
+                    crate::log::raw(&format!("[cratond] outbox: skipping corrupt entry: {e}"));
                     None
                 }
             })
@@ -382,10 +385,10 @@ impl Outbox {
             } else {
                 // No delivered entries left — must drop an undelivered one.
                 let lost = self.entries.remove(0);
-                eprintln!(
+                crate::log::raw(&format!(
                     "[cratond] OUTBOX OVERFLOW: evicting undelivered alert '{}' (created_at={})",
                     lost.alert.title, lost.created_at
-                );
+                ));
                 undelivered_lost = true;
             }
         }
@@ -402,11 +405,13 @@ impl Outbox {
                     buf.push_str(&line);
                     buf.push('\n');
                 }
-                Err(e) => eprintln!("[cratond] outbox: failed to serialize entry: {e}"),
+                Err(e) => crate::log::raw(&format!(
+                    "[cratond] outbox: failed to serialize entry: {e}"
+                )),
             }
         }
         if let Err(e) = crate::persist::atomic_write(path, buf.as_bytes()) {
-            eprintln!("[cratond] failed to persist outbox: {e}");
+            crate::log::raw(&format!("[cratond] failed to persist outbox: {e}"));
         }
     }
 

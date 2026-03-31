@@ -18,10 +18,10 @@ pub fn get_usage(path: &str, mono_secs: u64) -> Option<DiskSample> {
         let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
         let ret = unsafe { libc::statfs(c_path.as_ptr(), &mut stat) };
         if ret != 0 {
-            eprintln!(
+            crate::log::raw(&format!(
                 "[cratond] statfs({path}) failed: {}",
                 std::io::Error::last_os_error()
-            );
+            ));
             return None;
         }
 
@@ -56,7 +56,7 @@ pub fn get_usage(path: &str, mono_secs: u64) -> Option<DiskSample> {
 /// Standard cleanup: `apt clean` + journal vacuum.
 #[allow(dead_code)] // Phase 4: wired via RunDiskCleanup command
 pub fn cleanup_standard() {
-    eprintln!("[cratond] disk cleanup: standard");
+    crate::log::raw("[cratond] disk cleanup: standard");
 
     let _ = crate::effect::exec::run(&["apt-get", "clean"], Duration::from_secs(60));
 
@@ -73,7 +73,7 @@ pub fn cleanup_standard() {
 pub fn cleanup_aggressive() {
     cleanup_standard();
 
-    eprintln!("[cratond] disk cleanup: aggressive (docker prune)");
+    crate::log::raw("[cratond] disk cleanup: aggressive (docker prune)");
     let _ = crate::effect::exec::run(
         &["docker", "image", "prune", "-a", "-f"],
         Duration::from_secs(120),

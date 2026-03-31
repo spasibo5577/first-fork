@@ -23,7 +23,7 @@ pub struct CratonConfig {
     pub disk: DiskConfig,
 
     #[serde(default = "default_updates")]
-    #[allow(dead_code)] // Phase 4: update scheduling
+    #[expect(dead_code, reason = "updates config is parsed and preserved for compatibility")]
     pub updates: UpdatesConfig,
     
     #[serde(default = "default_ai")]
@@ -118,7 +118,7 @@ impl CratonConfig {
 // ─── Sub-configs ───────────────────────────────────────────────
 
 /// Daemon-level settings (listen address, watchdog, logging).
-#[allow(dead_code)] // fields parsed from TOML, consumed as runtime wiring completes
+#[expect(dead_code, reason = "some daemon config fields are parsed but not yet consumed")]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonConfig {
@@ -140,7 +140,6 @@ pub struct NtfyConfig {
 }
 
 /// Backup configuration — restic paths, schedule, retention.
-#[allow(dead_code)] // fields consumed by backup executor in Phase 4
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BackupConfig {
@@ -161,7 +160,6 @@ pub struct BackupConfig {
 }
 
 /// Restic retention policy (forget --keep-*).
-#[allow(dead_code)] // consumed by `ResticForget` command construction
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RetentionConfig {
@@ -174,7 +172,7 @@ pub struct RetentionConfig {
 }
 
 /// Disk monitoring thresholds and prediction toggle.
-#[allow(dead_code)] // consumed by disk policy in Phase 4
+#[expect(dead_code, reason = "disk config retains parsed fields that are not all wired yet")]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DiskConfig {
@@ -189,7 +187,7 @@ pub struct DiskConfig {
 }
 
 /// Update check schedules.
-#[allow(dead_code)] // consumed by update scheduling in Phase 4
+#[expect(dead_code, reason = "update schedule config is preserved for future wiring")]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdatesConfig {
@@ -200,7 +198,7 @@ pub struct UpdatesConfig {
 }
 
 /// AI/PicoClaw integration settings.
-#[allow(dead_code)] // consumed by AI bridge in Phase 4
+#[expect(dead_code, reason = "AI config retains parsed fields that are not all consumed yet")]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AiConfig {
@@ -217,7 +215,7 @@ pub struct AiConfig {
 // ─── Service entry ─────────────────────────────────────────────
 
 /// One `[[service]]` block in the TOML config.
-#[allow(dead_code)] // all fields parsed; some consumed in later phases
+#[expect(dead_code, reason = "service config surface is retained even if some fields are not yet used")]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceEntry {

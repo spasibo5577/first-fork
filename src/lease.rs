@@ -7,14 +7,12 @@ use crate::model::ResourceId;
 use std::collections::BTreeMap;
 
 /// Tracks which resources are currently held and by whom.
-#[allow(dead_code)] // Phase 4: wired via AcquireLease/ReleaseLease commands
 #[derive(Debug)]
 pub struct LeaseArbiter {
     held: BTreeMap<ResourceId, LeaseEntry>,
     max_ttl_secs: u64,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct LeaseEntry {
     holder: String,
@@ -22,7 +20,6 @@ struct LeaseEntry {
 }
 
 /// Result of trying to acquire a lease.
-#[allow(dead_code)] // Phase 4: lease conflict handling
 #[derive(Debug, PartialEq, Eq)]
 pub enum AcquireResult {
     Granted,
@@ -30,7 +27,6 @@ pub enum AcquireResult {
     GrantedAfterEviction { previous_holder: String },
 }
 
-#[allow(dead_code)] // Phase 4: lease management
 impl LeaseArbiter {
     #[must_use]
     pub fn new(max_ttl_secs: u64) -> Self {
@@ -81,25 +77,10 @@ impl LeaseArbiter {
         AcquireResult::Granted
     }
 
-    pub fn release(&mut self, resource: &ResourceId, holder: &str) -> bool {
-        if let Some(entry) = self.held.get(resource) {
-            if entry.holder == holder {
-                self.held.remove(resource);
-                return true;
-            }
-        }
-        false
-    }
-
     /// Unconditionally releases a lease regardless of holder.
     /// Used by the effect executor when the reducer emits `ReleaseLease`.
     pub fn force_release(&mut self, resource: &ResourceId) {
         self.held.remove(resource);
-    }
-
-    #[must_use]
-    pub fn holder(&self, resource: &ResourceId) -> Option<&str> {
-        self.held.get(resource).map(|e| e.holder.as_str())
     }
 
     #[must_use]
@@ -111,6 +92,25 @@ impl LeaseArbiter {
                 age >= self.max_ttl_secs
             }
         }
+    }
+
+}
+
+#[cfg(test)]
+impl LeaseArbiter {
+    pub fn release(&mut self, resource: &ResourceId, holder: &str) -> bool {
+        if let Some(entry) = self.held.get(resource) {
+            if entry.holder == holder {
+                self.held.remove(resource);
+                return true;
+            }
+        }
+        false
+    }
+
+    #[must_use]
+    pub fn holder(&self, resource: &ResourceId) -> Option<&str> {
+        self.held.get(resource).map(|e| e.holder.as_str())
     }
 
     pub fn evict_expired(&mut self, now_mono_secs: u64) {

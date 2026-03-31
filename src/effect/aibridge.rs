@@ -23,7 +23,7 @@ pub fn trigger(picoclaw_url: &str, event_type: &str, details: &BTreeMap<String, 
         .name("picoclaw-trigger".into())
         .spawn(move || {
             if let Err(e) = send_post(&url, &body) {
-                eprintln!("[cratond] PicoClaw trigger failed (non-fatal): {e}");
+                crate::log::raw(&format!("[cratond] PicoClaw trigger failed (non-fatal): {e}"));
             }
         })
         .ok();

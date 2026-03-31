@@ -90,7 +90,6 @@ impl SdNotify {
 
 /// Returns recommended watchdog ping interval from `WATCHDOG_USEC`.
 /// Returns half the interval as recommended by systemd docs.
-#[allow(dead_code)] // Phase 4: adaptive watchdog interval
 #[must_use]
 pub fn watchdog_interval() -> Option<std::time::Duration> {
     let usec: u64 = std::env::var("WATCHDOG_USEC").ok()?.parse().ok()?;
