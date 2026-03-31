@@ -352,14 +352,14 @@ fn map_command(command: RawCommand) -> Result<Command, CratonctlError> {
 
 const EXTRA_HELP: &str = "Read-only commands:\n  health\n  status\n  services\n  service <id>\n  history <recovery|backup|remediation>\n  diagnose <service>\n  doctor\n\nMutating commands:\n  trigger <task>\n  restart <service>\n  maintenance set <service> --reason <text>\n  maintenance clear <service>\n  breaker clear <service>\n  flapping clear <service>\n  backup run\n  backup unlock\n  disk cleanup\n\nAuth behavior:\n  Read-only commands do not require a token.\n  Mutating commands resolve token in this order:\n    1. --token\n    2. CRATONCTL_TOKEN\n    3. --token-file\n    4. /var/lib/craton/remediation-token\n\nExamples:\n  cratonctl status\n  cratonctl services\n  cratonctl service ntfy\n  cratonctl doctor\n  cratonctl restart ntfy --token-file /var/lib/craton/remediation-token\n  cratonctl maintenance set ntfy --reason \"manual work\"\n  cratonctl backup run --json --token \"$CRATONCTL_TOKEN\"";
 
-const TRIGGER_HELP: &str = "Common task names:\n  recovery\n  backup\n\nExamples:\n  cratonctl trigger recovery --token-file /var/lib/craton/remediation-token\n  cratonctl trigger backup --token \"$CRATONCTL_TOKEN\"\n\nNotes:\n  This command requires mutating auth.\n  The daemon remains the source of truth for accepted task names.";
+const TRIGGER_HELP: &str = "Common task names:\n  recovery\n  backup\n\nExamples:\n  cratonctl trigger recovery\n  cratonctl trigger backup\n\nNotes:\n  This command uses the daemon trigger path without requiring remediation auth.\n  The daemon remains the source of truth for accepted task names.";
 
 const MAINTENANCE_HELP: &str = "Examples:\n  cratonctl maintenance set ntfy --reason \"manual investigation\"\n  cratonctl maintenance clear ntfy\n\nNotes:\n  Maintenance commands require mutating auth.\n  The CLI does not manage maintenance duration locally.";
 const MAINTENANCE_SET_HELP: &str = "Examples:\n  cratonctl maintenance set ntfy --reason \"manual investigation\"\n  cratonctl maintenance set api --reason \"planned restart\"\n\nNotes:\n  This command requires mutating auth.\n  The reason must be non-empty.";
 const MAINTENANCE_CLEAR_HELP: &str = "Examples:\n  cratonctl maintenance clear ntfy\n\nNotes:\n  This command requires mutating auth.";
 
-const BACKUP_HELP: &str = "Examples:\n  cratonctl backup run --token-file /var/lib/craton/remediation-token\n  cratonctl backup unlock --token \"$CRATONCTL_TOKEN\"\n\nNotes:\n  Both commands require mutating auth.\n  `run` goes through the daemon trigger path; `unlock` goes through remediation.";
-const BACKUP_RUN_HELP: &str = "Examples:\n  cratonctl backup run --token-file /var/lib/craton/remediation-token\n  cratonctl backup run --token \"$CRATONCTL_TOKEN\"\n\nNotes:\n  This command requires mutating auth.\n  It uses the daemon trigger path rather than touching backup state directly.";
+const BACKUP_HELP: &str = "Examples:\n  cratonctl backup run\n  cratonctl backup unlock --token \"$CRATONCTL_TOKEN\"\n\nNotes:\n  `run` goes through the daemon trigger path and does not require remediation auth.\n  `unlock` goes through remediation and still requires mutating auth.";
+const BACKUP_RUN_HELP: &str = "Examples:\n  cratonctl backup run\n  cratonctl backup run --json\n\nNotes:\n  This command uses the daemon trigger path and does not require remediation auth.\n  It does not touch backup state directly.";
 const BACKUP_UNLOCK_HELP: &str = "Examples:\n  cratonctl backup unlock --token-file /var/lib/craton/remediation-token\n  cratonctl backup unlock --token \"$CRATONCTL_TOKEN\"\n\nNotes:\n  This command requires mutating auth.\n  It requests a daemon-side remediation action.";
 
 const DOCTOR_HELP: &str = "Checks:\n  daemon reachability\n  GET /health\n  GET /api/v1/state\n  token file accessibility\n  read-only and mutating readiness\n\nExamples:\n  cratonctl doctor\n  cratonctl --json doctor\n  cratonctl --url http://127.0.0.1:18800 doctor\n\nNotes:\n  `doctor` never sends mutating requests.\n  Use it as a safe preflight before restart/maintenance/backup actions.";
@@ -489,6 +489,7 @@ mod tests {
         assert!(text.contains("Common task names:"));
         assert!(text.contains("recovery"));
         assert!(text.contains("backup"));
+        assert!(!text.contains("requires mutating auth"));
     }
 
     #[test]
@@ -532,7 +533,8 @@ mod tests {
             panic!("expected help command");
         };
         assert!(!top_level);
-        assert!(text.contains("requires mutating auth"));
+        assert!(text.contains("does not require remediation auth"));
         assert!(text.contains("daemon trigger path"));
     }
 }
+

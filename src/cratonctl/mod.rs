@@ -38,7 +38,7 @@ fn run_cli(parsed: &cli::Cli) -> Result<i32, CratonctlError> {
         cli::Command::History { kind } => handle_history(&client, &parsed.global, *kind),
         cli::Command::Diagnose { service } => handle_diagnose(&client, &parsed.global, service),
         cli::Command::Doctor => handle_doctor(&client, &resolved, &parsed.global),
-        cli::Command::Trigger { task } => handle_trigger(&client, &resolved, &parsed.global, task),
+        cli::Command::Trigger { task } => handle_trigger(&client, &parsed.global, task),
         cli::Command::Restart { service } => handle_remediation_command(&client, &resolved, &parsed.global, RemediationSpec {
             action: "RestartService",
             target: Some(service.as_str()),
@@ -74,7 +74,7 @@ fn run_cli(parsed: &cli::Cli) -> Result<i32, CratonctlError> {
             label: "flapping clear",
             display_target: Some(service.as_str()),
         }),
-        cli::Command::BackupRun => handle_trigger(&client, &resolved, &parsed.global, "backup"),
+        cli::Command::BackupRun => handle_trigger(&client, &parsed.global, "backup"),
         cli::Command::BackupUnlock => handle_remediation_command(&client, &resolved, &parsed.global, RemediationSpec {
             action: "ResticUnlock",
             target: None,
@@ -379,13 +379,11 @@ fn mutating_check(resolved: &auth::ResolvedConfig) -> dto::DoctorCheck {
 
 fn handle_trigger(
     client: &client::Client,
-    resolved: &auth::ResolvedConfig,
     global: &cli::GlobalArgs,
     task: &str,
 ) -> Result<i32, CratonctlError> {
-    let token = auth::require_token(resolved)?;
     let path = format!("/trigger/{}", client::path_segment(task));
-    let response = client.post_json::<dto::CommandAcceptedResponse>(&path, "{}", token)?;
+    let response = client.post_json_no_auth::<dto::CommandAcceptedResponse>(&path, "{}")?;
     let result = dto::CommandResult {
         action: "trigger".into(),
         status: response.status,
@@ -582,3 +580,4 @@ mod tests {
         assert_eq!(check.detail, "token looks usable for mutating commands");
     }
 }
+

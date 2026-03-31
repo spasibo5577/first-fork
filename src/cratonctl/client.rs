@@ -55,6 +55,14 @@ impl Client {
         Self::decode_json_response(path, response)
     }
 
+    pub fn post_json_no_auth<T>(&self, path: &str, body: &str) -> Result<T, CratonctlError>
+    where
+        T: DeserializeOwned,
+    {
+        let response = self.send_request("POST", path, Some(body), None)?;
+        Self::decode_json_response(path, response)
+    }
+
     fn decode_json_response<T>(path: &str, response: Response) -> Result<T, CratonctlError>
     where
         T: DeserializeOwned,
@@ -228,6 +236,9 @@ fn compact_body(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cratonctl::dto::CommandAcceptedResponse;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
 
     #[test]
     fn parse_base_url_with_port_and_base_path() {
@@ -255,4 +266,41 @@ mod tests {
     fn path_segment_encodes_spaces() {
         assert_eq!(path_segment("hello world"), "hello%20world");
     }
+
+    #[test]
+    fn post_json_no_auth_omits_authorization_header() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .unwrap_or_else(|err| panic!("unexpected bind error: {err}"));
+        let address = listener
+            .local_addr()
+            .unwrap_or_else(|err| panic!("unexpected local_addr error: {err}"));
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener
+                .accept()
+                .unwrap_or_else(|err| panic!("unexpected accept error: {err}"));
+            let mut request = [0_u8; 4096];
+            let read = stream
+                .read(&mut request)
+                .unwrap_or_else(|err| panic!("unexpected read error: {err}"));
+            let request_text = String::from_utf8(request[..read].to_vec())
+                .unwrap_or_else(|err| panic!("unexpected utf8 error: {err}"));
+            assert!(!request_text.contains("Authorization: Bearer"));
+            stream
+                .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 21\r\n\r\n{\"status\":\"accepted\"}")
+                .unwrap_or_else(|err| panic!("unexpected write error: {err}"));
+        });
+
+        let client = Client::new(&format!("http://127.0.0.1:{}", address.port()));
+        let response = client
+            .post_json_no_auth::<CommandAcceptedResponse>("/trigger/recovery", "{}")
+            .unwrap_or_else(|err| panic!("unexpected client error: {err}"));
+
+        assert_eq!(response.status, "accepted");
+        server
+            .join()
+            .unwrap_or_else(|_| panic!("unexpected server join failure"));
+    }
 }
+
+
