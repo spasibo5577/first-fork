@@ -93,17 +93,24 @@ pub fn render_status(status: &StatusSummary, presentation: Presentation) -> Stri
             status.health.reason
         ),
         format!(
+            "startup: {}",
+            paint_meta(&render_startup_kind(&status.startup_kind), presentation)
+        ),
+        format!(
             "services: {} total, {} degraded",
             status.service_count, status.degraded_count
         ),
         format!("states: {}", paint_meta(&state_counts, presentation)),
         format!("backup: {}", paint_meta(&status.backup_phase, presentation)),
         format!("disk: {}", paint_meta(&disk, presentation)),
-        format!(
+    ];
+
+    if status.notify_degraded {
+        lines.push(format!(
             "notifications: {}",
             render_notify_summary(status, presentation)
-        ),
-    ];
+        ));
+    }
 
     if status.shutting_down {
         lines.push("daemon: shutting down".into());
@@ -119,15 +126,25 @@ fn render_notify_summary(status: &StatusSummary, presentation: Presentation) -> 
     if status.notify_degraded {
         if status.notify_consecutive_failures > 0 {
             format!(
-                "{} ({} failures)",
-                paint_warn("degraded", presentation),
+                "{} ({} consecutive failures)",
+                paint_warn("DEGRADED", presentation),
                 status.notify_consecutive_failures
             )
         } else {
-            paint_warn("degraded", presentation)
+            paint_warn("DEGRADED", presentation)
         }
     } else {
-        paint_ok("healthy", presentation)
+        paint_ok("OK", presentation)
+    }
+}
+
+fn render_startup_kind(kind: &str) -> String {
+    match kind {
+        "host_boot" => "Host reboot".into(),
+        "daemon_restart" => "Daemon restart".into(),
+        "first_start" => "First start".into(),
+        "unknown" => "Unknown".into(),
+        other => other.replace('_', " "),
     }
 }
 
@@ -790,16 +807,80 @@ mod tests {
                     .collect(),
                 backup_phase: "idle".into(),
                 disk_usage_percent: Some(42),
+                startup_kind: "host_boot".into(),
                 shutting_down: false,
                 outbox_overflow: false,
                 notify_degraded: true,
                 notify_consecutive_failures: 3,
+                notify_last_success_epoch_secs: 0,
+                notify_last_failure_epoch_secs: 0,
                 snapshot_epoch_secs: 0,
                 last_recovery_mono: None,
             },
             PLAIN,
         );
-        assert!(rendered.contains("notifications: degraded (3 failures)"));
+        assert!(rendered.contains("startup: Host reboot"));
+        assert!(rendered.contains("notifications: DEGRADED (3 consecutive failures)"));
+    }
+
+    #[test]
+    fn status_renderer_omits_notification_line_when_not_degraded() {
+        let rendered = render_status(
+            &StatusSummary {
+                health: HealthResponse {
+                    status: "ok".into(),
+                    reason: "ok".into(),
+                },
+                service_count: 2,
+                degraded_count: 0,
+                state_counts: [("healthy".into(), 2)].into_iter().collect(),
+                backup_phase: "idle".into(),
+                disk_usage_percent: Some(28),
+                startup_kind: "daemon_restart".into(),
+                shutting_down: false,
+                outbox_overflow: false,
+                notify_degraded: false,
+                notify_consecutive_failures: 0,
+                notify_last_success_epoch_secs: 0,
+                notify_last_failure_epoch_secs: 0,
+                snapshot_epoch_secs: 0,
+                last_recovery_mono: None,
+            },
+            PLAIN,
+        );
+        assert!(rendered.contains("startup: Daemon restart"));
+        assert!(!rendered.contains("notifications:"));
+    }
+
+    #[test]
+    fn status_json_keeps_startup_and_notify_fields() {
+        let json = serde_json::to_string(&StatusSummary {
+            health: HealthResponse {
+                status: "ok".into(),
+                reason: "ok".into(),
+            },
+            service_count: 1,
+            degraded_count: 0,
+            state_counts: [("healthy".into(), 1)].into_iter().collect(),
+            backup_phase: "idle".into(),
+            disk_usage_percent: None,
+            startup_kind: "host_boot".into(),
+            shutting_down: false,
+            outbox_overflow: false,
+            notify_degraded: true,
+            notify_consecutive_failures: 5,
+            notify_last_success_epoch_secs: 1_700_000_000,
+            notify_last_failure_epoch_secs: 1_700_000_100,
+            snapshot_epoch_secs: 1_700_000_200,
+            last_recovery_mono: None,
+        })
+        .unwrap_or_else(|err| panic!("unexpected json error: {err}"));
+
+        assert!(json.contains("\"startup_kind\":\"host_boot\""));
+        assert!(json.contains("\"notify_degraded\":true"));
+        assert!(json.contains("\"notify_consecutive_failures\":5"));
+        assert!(json.contains("\"notify_last_success_epoch_secs\":1700000000"));
+        assert!(json.contains("\"notify_last_failure_epoch_secs\":1700000100"));
     }
 
     #[test]

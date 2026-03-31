@@ -19,14 +19,16 @@ pub struct StateSnapshot {
     pub services: BTreeMap<String, ServiceStatusDto>,
     pub backup_phase: BackupPhaseDto,
     pub disk_usage_percent: Option<u32>,
+    #[serde(default = "default_startup_kind")]
+    pub startup_kind: String,
     #[serde(default)]
     pub notify_degraded: bool,
     #[serde(default)]
-    pub notify_consecutive_failures: u32,
+    pub notify_consecutive_failures: u64,
     #[serde(default)]
-    pub notify_last_success_epoch_secs: Option<u64>,
+    pub notify_last_success_epoch_secs: u64,
     #[serde(default)]
-    pub notify_last_failure_epoch_secs: Option<u64>,
+    pub notify_last_failure_epoch_secs: u64,
     pub shutting_down: bool,
     pub backup_history: Vec<BackupRecordDto>,
     pub recovery_history: Vec<RecoveryRecordDto>,
@@ -181,10 +183,13 @@ pub struct StatusSummary {
     pub state_counts: BTreeMap<String, usize>,
     pub backup_phase: String,
     pub disk_usage_percent: Option<u32>,
+    pub startup_kind: String,
     pub shutting_down: bool,
     pub outbox_overflow: bool,
     pub notify_degraded: bool,
-    pub notify_consecutive_failures: u32,
+    pub notify_consecutive_failures: u64,
+    pub notify_last_success_epoch_secs: u64,
+    pub notify_last_failure_epoch_secs: u64,
     pub snapshot_epoch_secs: u64,
     pub last_recovery_mono: Option<u64>,
 }
@@ -210,14 +215,21 @@ impl StatusSummary {
             state_counts,
             backup_phase: state.backup_phase.phase_name().into(),
             disk_usage_percent: state.disk_usage_percent,
+            startup_kind: state.startup_kind.clone(),
             shutting_down: state.shutting_down,
             outbox_overflow: state.outbox_overflow,
             notify_degraded: state.notify_degraded,
             notify_consecutive_failures: state.notify_consecutive_failures,
+            notify_last_success_epoch_secs: state.notify_last_success_epoch_secs,
+            notify_last_failure_epoch_secs: state.notify_last_failure_epoch_secs,
             snapshot_epoch_secs: state.snapshot_epoch_secs,
             last_recovery_mono: state.last_recovery_mono,
         }
     }
+}
+
+fn default_startup_kind() -> String {
+    "unknown".into()
 }
 
 #[derive(Debug, Clone, Serialize)]

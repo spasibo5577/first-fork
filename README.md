@@ -19,6 +19,7 @@
   - histories и diagnose endpoint
 - `cratonctl`:
   - read-only статус и истории
+  - `auth status` для прозрачной проверки auth/token readiness
   - trigger задач
   - maintenance / breaker / flapping команды
   - backup run / unlock
@@ -31,6 +32,7 @@
 - не даёт второму клиенту стать отдельным контроллером системы
 - не предоставляет TUI, watch mode или autocomplete в текущем коде
 - не документирует ZeroClaw как готовую интеграцию: в конфиге сейчас есть AI-поля с `picoclaw_url`
+- не печатает Bearer token в help, status или JSON output
 
 ## Quick Start
 
@@ -87,7 +89,9 @@ sudo systemctl status cratond
 ```bash
 curl -s http://127.0.0.1:18800/health
 cratonctl health
+cratonctl auth status
 cratonctl status
+cratonctl doctor
 cratonctl services
 ```
 
@@ -114,6 +118,21 @@ Token resolution для mutating-команд:
 3. `--token-file`
 4. `/var/lib/craton/remediation-token`
 
+Для безопасной проверки auth/token readiness используй:
+
+```bash
+cratonctl auth status
+cratonctl doctor
+```
+
+`auth status` показывает URL, порядок резолва токена, состояние token file и доступность mutating-команд.
+`doctor` дополняет это общим preflight по daemon/API и actionable advice.
+
+`cratonctl status` теперь также показывает:
+
+- тип запуска демона (`startup_kind`) в operator-friendly виде
+- предупреждение о деградации канала уведомлений только если есть проблема
+
 Поддерживаются:
 
 - human-readable output по умолчанию
@@ -127,6 +146,7 @@ Read-only:
 
 ```bash
 cratonctl health
+cratonctl auth status
 cratonctl status
 cratonctl services
 cratonctl service ntfy
@@ -160,6 +180,7 @@ cratonctl trigger backup
 - не дублирует daemon policy
 - не предоставляет TUI, watch mode, completions или YAML output
 - не поддерживает `https://` в текущем CLI
+- не печатает токен и не делает mutating side effects в `doctor`/`auth status`
 
 ## Конфиг
 
@@ -250,6 +271,11 @@ Mutating:
 - `services`
 - `backup_phase`
 - `disk_usage_percent`
+- `startup_kind`
+- `notify_degraded`
+- `notify_consecutive_failures`
+- `notify_last_success_epoch_secs`
+- `notify_last_failure_epoch_secs`
 - `backup_history`
 - `recovery_history`
 - `remediation_history`
@@ -322,6 +348,13 @@ Backup FSM:
 4. проверить `restic`, `systemctl`, `journalctl`, `ntfy`
 5. запустить `systemctl enable --now cratond`
 6. проверить `/health`, `cratonctl status`, `cratonctl history backup`
+
+Для первого operator onboarding после деплоя также полезно сразу проверить:
+
+```bash
+cratonctl auth status
+cratonctl doctor
+```
 
 ## Файлы на диске
 
