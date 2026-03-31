@@ -30,6 +30,7 @@ pub enum Command {
     Doctor,
     Trigger { task: String },
     Restart { service: String },
+    DockerRestart { container: String },
     MaintenanceSet { service: String, reason: String },
     MaintenanceClear { service: String },
     BreakerClear { service: String },
@@ -201,6 +202,13 @@ enum RawCommand {
     },
     #[command(
         subcommand,
+        about = "Docker operations",
+        long_about = "Docker-related operator commands routed through daemon remediation actions.",
+        after_help = DOCKER_HELP
+    )]
+    Docker(RawDockerCommand),
+    #[command(
+        subcommand,
         about = "Manage maintenance mode",
         long_about = "Manage maintenance mode through daemon remediation actions.\nUse set with a non-empty reason; clear removes maintenance.",
         after_help = MAINTENANCE_HELP
@@ -288,6 +296,19 @@ enum RawBackupCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum RawDockerCommand {
+    #[command(
+        about = "Restart a Docker container through daemon policy",
+        long_about = "Request a Docker container restart through the daemon remediation API.",
+        after_help = DOCKER_RESTART_HELP
+    )]
+    Restart {
+        #[arg(value_name = "container")]
+        container: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum RawDiskCommand {
     #[command(about = "Run disk cleanup")]
     Cleanup,
@@ -327,6 +348,9 @@ fn map_command(command: RawCommand) -> Result<Command, CratonctlError> {
         RawCommand::Doctor => Ok(Command::Doctor),
         RawCommand::Trigger { task } => Ok(Command::Trigger { task }),
         RawCommand::Restart { service } => Ok(Command::Restart { service }),
+        RawCommand::Docker(RawDockerCommand::Restart { container }) => {
+            Ok(Command::DockerRestart { container })
+        }
         RawCommand::Maintenance(command) => match command {
             RawMaintenanceCommand::Set { service, reason } => {
                 if reason.trim().is_empty() {
@@ -350,7 +374,7 @@ fn map_command(command: RawCommand) -> Result<Command, CratonctlError> {
     }
 }
 
-const EXTRA_HELP: &str = "Read-only commands:\n  health\n  status\n  services\n  service <id>\n  history <recovery|backup|remediation>\n  diagnose <service>\n  doctor\n\nMutating commands:\n  trigger <task>\n  restart <service>\n  maintenance set <service> --reason <text>\n  maintenance clear <service>\n  breaker clear <service>\n  flapping clear <service>\n  backup run\n  backup unlock\n  disk cleanup\n\nAuth behavior:\n  Read-only commands do not require a token.\n  Mutating commands resolve token in this order:\n    1. --token\n    2. CRATONCTL_TOKEN\n    3. --token-file\n    4. /var/lib/craton/remediation-token\n\nExamples:\n  cratonctl status\n  cratonctl services\n  cratonctl service ntfy\n  cratonctl doctor\n  cratonctl restart ntfy --token-file /var/lib/craton/remediation-token\n  cratonctl maintenance set ntfy --reason \"manual work\"\n  cratonctl backup run --json --token \"$CRATONCTL_TOKEN\"";
+const EXTRA_HELP: &str = "Read-only commands:\n  health\n  status\n  services\n  service <id>\n  history <recovery|backup|remediation>\n  diagnose <service>\n  doctor\n\nMutating commands:\n  trigger <task>\n  restart <service>\n  docker restart <container>\n  maintenance set <service> --reason <text>\n  maintenance clear <service>\n  breaker clear <service>\n  flapping clear <service>\n  backup run\n  backup unlock\n  disk cleanup\n\nAuth behavior:\n  Read-only commands do not require a token.\n  Mutating commands resolve token in this order:\n    1. --token\n    2. CRATONCTL_TOKEN\n    3. --token-file\n    4. /var/lib/craton/remediation-token\n\nExamples:\n  cratonctl status\n  cratonctl services\n  cratonctl service ntfy\n  cratonctl doctor\n  cratonctl restart ntfy --token-file /var/lib/craton/remediation-token\n  cratonctl maintenance set ntfy --reason \"manual work\"\n  cratonctl backup run --json --token \"$CRATONCTL_TOKEN\"";
 
 const TRIGGER_HELP: &str = "Common task names:\n  recovery\n  backup\n\nExamples:\n  cratonctl trigger recovery\n  cratonctl trigger backup\n\nNotes:\n  This command uses the daemon trigger path without requiring remediation auth.\n  The daemon remains the source of truth for accepted task names.";
 
@@ -361,6 +385,8 @@ const MAINTENANCE_CLEAR_HELP: &str = "Examples:\n  cratonctl maintenance clear n
 const BACKUP_HELP: &str = "Examples:\n  cratonctl backup run\n  cratonctl backup unlock --token \"$CRATONCTL_TOKEN\"\n\nNotes:\n  `run` goes through the daemon trigger path and does not require remediation auth.\n  `unlock` goes through remediation and still requires mutating auth.";
 const BACKUP_RUN_HELP: &str = "Examples:\n  cratonctl backup run\n  cratonctl backup run --json\n\nNotes:\n  This command uses the daemon trigger path and does not require remediation auth.\n  It does not touch backup state directly.";
 const BACKUP_UNLOCK_HELP: &str = "Examples:\n  cratonctl backup unlock --token-file /var/lib/craton/remediation-token\n  cratonctl backup unlock --token \"$CRATONCTL_TOKEN\"\n\nNotes:\n  This command requires mutating auth.\n  It requests a daemon-side remediation action.";
+const DOCKER_HELP: &str = "Examples:\n  cratonctl docker restart redis --token-file /var/lib/craton/remediation-token\n\nNotes:\n  Docker commands require mutating auth.\n  They go through daemon remediation rather than talking to Docker directly.";
+const DOCKER_RESTART_HELP: &str = "Examples:\n  cratonctl docker restart redis --token-file /var/lib/craton/remediation-token\n  cratonctl docker restart postgres --token \"$CRATONCTL_TOKEN\"\n\nNotes:\n  This command requires mutating auth.\n  It sends the DockerRestart remediation action with reason \"operator\".";
 
 const DOCTOR_HELP: &str = "Checks:\n  daemon reachability\n  GET /health\n  GET /api/v1/state\n  token file accessibility\n  read-only and mutating readiness\n\nExamples:\n  cratonctl doctor\n  cratonctl --json doctor\n  cratonctl --url http://127.0.0.1:18800 doctor\n\nNotes:\n  `doctor` never sends mutating requests.\n  Use it as a safe preflight before restart/maintenance/backup actions.";
 
@@ -451,6 +477,17 @@ mod tests {
     }
 
     #[test]
+    fn parses_docker_restart_command() {
+        let cli = parse_ok(&["cratonctl", "docker", "restart", "redis"]);
+        assert_eq!(
+            cli.command,
+            Command::DockerRestart {
+                container: "redis".into()
+            }
+        );
+    }
+
+    #[test]
     fn parses_auth_status_command() {
         let cli = parse_ok(&["cratonctl", "auth", "status"]);
         assert_eq!(cli.command, Command::AuthStatus);
@@ -527,6 +564,17 @@ mod tests {
     }
 
     #[test]
+    fn docker_restart_help_mentions_auth_and_reason() {
+        let cli = parse_ok(&["cratonctl", "docker", "restart", "--help"]);
+        let Command::Help { text, top_level } = cli.command else {
+            panic!("expected help command");
+        };
+        assert!(!top_level);
+        assert!(text.contains("requires mutating auth"));
+        assert!(text.contains("DockerRestart remediation action"));
+    }
+
+    #[test]
     fn backup_run_help_mentions_trigger_path_and_auth() {
         let cli = parse_ok(&["cratonctl", "backup", "run", "--help"]);
         let Command::Help { text, top_level } = cli.command else {
@@ -537,4 +585,3 @@ mod tests {
         assert!(text.contains("daemon trigger path"));
     }
 }
-

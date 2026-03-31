@@ -46,6 +46,13 @@ fn run_cli(parsed: &cli::Cli) -> Result<i32, CratonctlError> {
             label: "restart",
             display_target: Some(service.as_str()),
         }),
+        cli::Command::DockerRestart { container } => handle_remediation_command(&client, &resolved, &parsed.global, RemediationSpec {
+            action: "DockerRestart",
+            target: Some(container.as_str()),
+            reason: Some("operator"),
+            label: "docker restart",
+            display_target: Some(container.as_str()),
+        }),
         cli::Command::MaintenanceSet { service, reason } => handle_remediation_command(&client, &resolved, &parsed.global, RemediationSpec {
             action: "MarkMaintenance",
             target: Some(service.as_str()),
@@ -580,4 +587,6 @@ mod tests {
         assert_eq!(check.detail, "token looks usable for mutating commands");
     }
 }
+
+
 
