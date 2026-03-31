@@ -5,7 +5,8 @@
 //! control loop via the event channel.
 //!
 //! # Auth
-//! `POST /api/v1/remediate` requires `Authorization: Bearer <token>`.
+//! `POST /api/v1/remediate` and `POST /trigger/{task}` require
+//! `Authorization: Bearer <token>`.
 //! The token is loaded/generated at startup and written to `ai.token_path`.
 //! The token is NEVER written to the audit trail — `source` is always `"http:api"`.
 
@@ -69,7 +70,10 @@ fn serve(
                 handle_history(&snapshot, path)
             }
             ("GET", path) if path.starts_with("/api/v1/diagnose/") => handle_diagnose(path),
-            ("POST", path) if path.starts_with("/trigger/") => handle_trigger(path, &event_tx),
+            ("POST", path) if path.starts_with("/trigger/") => {
+                let auth = authorization_header(&request);
+                handle_trigger(path, &auth, &event_tx, &token)
+            }
             ("POST", "/api/v1/remediate") => handle_remediate(&mut request, &event_tx, &token),
             _ => json_response(404, r#"{"error":"not found"}"#),
         };
@@ -171,7 +175,6 @@ fn handle_diagnose(path: &str) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> 
         return json_response(400, r#"{"error":"service name required"}"#);
     }
 
-    // Run diagnostic commands.
     let unit = format!("{service_name}.service");
 
     let active = crate::effect::exec::run(
@@ -203,10 +206,39 @@ fn handle_diagnose(path: &str) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> 
     json_response(200, &body.to_string())
 }
 
+fn authorization_header(request: &tiny_http::Request) -> String {
+    request
+        .headers()
+        .iter()
+        .find(|h| {
+            h.field
+                .as_str()
+                .as_str()
+                .eq_ignore_ascii_case("authorization")
+        })
+        .map(|h| h.value.as_str().to_string())
+        .unwrap_or_default()
+}
+
+fn is_authorized_bearer(auth_header: &str, expected_token: &str) -> bool {
+    let provided = auth_header
+        .strip_prefix("Bearer ")
+        .unwrap_or("")
+        .trim();
+
+    !expected_token.is_empty() && provided == expected_token
+}
+
 fn handle_trigger(
     path: &str,
+    auth_header: &str,
     event_tx: &mpsc::Sender<Event>,
+    expected_token: &str,
 ) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
+    if !is_authorized_bearer(auth_header, expected_token) {
+        return json_response(401, r#"{"error":"unauthorized"}"#);
+    }
+
     let task_name = path.strip_prefix("/trigger/").unwrap_or("");
 
     let task_kind = match task_name {
@@ -245,30 +277,11 @@ fn handle_remediate(
     event_tx: &mpsc::Sender<Event>,
     expected_token: &str,
 ) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
-    // --- Bearer token check ---
-    let auth = request
-        .headers()
-        .iter()
-        .find(|h| {
-            h.field
-                .as_str()
-                .as_str()
-                .eq_ignore_ascii_case("authorization")
-        })
-        .map(|h| h.value.as_str().to_string())
-        .unwrap_or_default();
-
-    let provided = auth
-        .strip_prefix("Bearer ")
-        .unwrap_or("")
-        .trim()
-        .to_string();
-
-    if provided != expected_token || expected_token.is_empty() {
+    let auth = authorization_header(request);
+    if !is_authorized_bearer(&auth, expected_token) {
         return json_response(401, r#"{"error":"unauthorized"}"#);
     }
 
-    // --- Read body (max 4 KB) ---
     let mut body = Vec::with_capacity(512);
     if request
         .as_reader()
@@ -284,7 +297,6 @@ fn handle_remediate(
         Err(_) => return json_response(400, r#"{"error":"invalid JSON"}"#),
     };
 
-    // --- Parse action ---
     let action_str = parsed.get("action").and_then(|v| v.as_str()).unwrap_or("");
 
     let action = match action_str {
@@ -303,7 +315,6 @@ fn handle_remediate(
         }
     };
 
-    // --- Parse optional target ---
     let target = parsed
         .get("target")
         .and_then(|v| v.as_str())
@@ -316,7 +327,6 @@ fn handle_remediate(
         .unwrap_or("http api")
         .to_string();
 
-    // Source is always "http:api" — the token is never written to the audit trail.
     let event = Event::HttpCommand(CommandRequest::Remediate {
         action,
         target,
@@ -456,6 +466,82 @@ mod tests {
     }
 
     #[test]
+    fn trigger_without_bearer_token_is_unauthorized() {
+        let (tx, _rx) = mpsc::channel();
+
+        let (status, data) = read_json(handle_trigger("/trigger/recovery", "", &tx, "secret-token"));
+
+        assert_eq!(status, tiny_http::StatusCode(401));
+        assert_eq!(data, serde_json::json!({"error":"unauthorized"}));
+    }
+
+    #[test]
+    fn trigger_with_invalid_bearer_token_is_unauthorized() {
+        let (tx, _rx) = mpsc::channel();
+
+        let (status, data) = read_json(handle_trigger(
+            "/trigger/recovery",
+            "Bearer wrong-token",
+            &tx,
+            "secret-token",
+        ));
+
+        assert_eq!(status, tiny_http::StatusCode(401));
+        assert_eq!(data, serde_json::json!({"error":"unauthorized"}));
+    }
+
+    #[test]
+    fn trigger_with_valid_bearer_token_accepts_known_task() {
+        let (tx, rx) = mpsc::channel();
+
+        let (status, data) = read_json(handle_trigger(
+            "/trigger/recovery",
+            "Bearer secret-token",
+            &tx,
+            "secret-token",
+        ));
+
+        assert_eq!(status, tiny_http::StatusCode(202));
+        assert_eq!(data, serde_json::json!({"status":"accepted","task":"recovery"}));
+        assert!(matches!(
+            rx.recv().unwrap(),
+            Event::HttpCommand(CommandRequest::Trigger(TaskKind::Recovery))
+        ));
+    }
+
+    #[test]
+    fn trigger_with_valid_bearer_token_preserves_unknown_task_behavior() {
+        let (tx, _rx) = mpsc::channel();
+
+        let (status, data) = read_json(handle_trigger(
+            "/trigger/not-a-task",
+            "Bearer secret-token",
+            &tx,
+            "secret-token",
+        ));
+
+        assert_eq!(status, tiny_http::StatusCode(404));
+        assert_eq!(data, serde_json::json!({"error":"unknown task: not-a-task"}));
+    }
+
+    #[test]
+    fn read_only_endpoints_remain_accessible_without_token() {
+        let snapshot_value = serde_json::json!({
+            "snapshot_epoch_secs": epoch_secs_now(),
+            "outbox_overflow": false,
+            "shutting_down": false,
+            "services": {}
+        });
+        let snapshot = snapshot_with(&snapshot_value);
+
+        let (health_status, _) = read_json(handle_health(&snapshot));
+        let (state_status, _) = read_json(handle_state(&snapshot));
+
+        assert_eq!(health_status, tiny_http::StatusCode(200));
+        assert_eq!(state_status, tiny_http::StatusCode(200));
+    }
+
+    #[test]
     fn history_recovery_returns_only_recovery_list() {
         let snapshot: SharedSnapshot = Arc::new(Mutex::new(
             r#"{"recovery_history":[{"mono":1,"recovered":[],"failed":[],"docker_restarted":false,"duration_ms":0}],"backup_history":[{"mono":2,"success":true,"partial":false,"error":null,"duration_secs":1}],"snapshot_epoch_secs":123}"#.to_string(),
@@ -509,4 +595,3 @@ mod tests {
         assert_eq!(data["snapshot_epoch_secs"], 123);
     }
 }
-
