@@ -39,6 +39,7 @@ pub fn reduce(
 
     match event {
         Event::Tick { due_tasks } => handle_tick(state, &due_tasks, config, ctx),
+        Event::StartupProbeResults(results) => handle_startup_probes(state, &results, graph, ctx),
         Event::ProbeResults(results) => handle_probes(state, &results, config, graph, ctx),
         Event::DiskSample(sample) => handle_disk_sample(state, sample, config),
         Event::EffectCompleted { cmd_id, result } => {
@@ -101,6 +102,49 @@ fn handle_tick(
 }
 
 // ─── Probes ────────────────────────────────────────────────────
+
+fn handle_startup_probes(
+    state: &mut State,
+    results: &[crate::model::ProbeResult],
+    graph: &DepGraph,
+    ctx: &Ctx,
+) -> Vec<Command> {
+    state.last_probe_cycle_mono = Some(ctx.mono_secs);
+
+    let mut unhealthy_set = std::collections::BTreeSet::new();
+    for result in results {
+        if !result.is_healthy() {
+            unhealthy_set.insert(result.service_id().clone());
+        }
+    }
+    let (_root_causes, blocked) = graph.classify_failures(&unhealthy_set);
+
+    for result in results {
+        let sid = result.service_id();
+        let Some(svc) = state.services.get_mut(sid) else {
+            continue;
+        };
+
+        svc.status = match result {
+            crate::model::ProbeResult::Healthy { .. } => ServiceStatus::Healthy {
+                since_mono: ctx.mono_secs,
+            },
+            crate::model::ProbeResult::Unhealthy { error, .. } => {
+                if let Some(root) = blocked.get(sid) {
+                    ServiceStatus::BlockedByDep { root: root.clone() }
+                } else {
+                    ServiceStatus::Unhealthy {
+                        since_mono: ctx.mono_secs,
+                        error: error.to_string(),
+                        consecutive: 1,
+                    }
+                }
+            }
+        };
+    }
+
+    vec![]
+}
 
 fn handle_probes(
     state: &mut State,
@@ -982,6 +1026,41 @@ url = "http://localhost:8080/v1/health"
         CratonConfig::from_toml(toml).unwrap()
     }
 
+    fn test_config_with_dependency() -> CratonConfig {
+        let toml = r#"
+[ntfy]
+url = "http://localhost"
+topic = "test"
+
+[backup]
+restic_repo = "/repo"
+restic_password_file = "/pass"
+
+[[service]]
+id = "unbound"
+name = "Unbound"
+unit = "unbound.service"
+kind = "systemd"
+severity = "critical"
+
+[service.probe]
+type = "systemd_active"
+
+[[service]]
+id = "ntfy"
+name = "NTFY"
+unit = "ntfy.service"
+kind = "systemd"
+severity = "critical"
+depends_on = ["unbound"]
+
+[service.probe]
+type = "http"
+url = "http://localhost:8080/v1/health"
+"#;
+        CratonConfig::from_toml(toml).unwrap()
+    }
+
     fn test_ctx(mono_secs: u64) -> Ctx {
         Ctx {
             mono_secs,
@@ -1109,6 +1188,66 @@ url = "http://localhost:8080/v1/health"
         assert!(cmds
             .iter()
             .any(|c| matches!(c, Command::RestartService { id, .. } if id.as_str() == "ntfy")));
+    }
+
+    #[test]
+    fn startup_probe_results_populate_state_without_restart() {
+        let config = test_config();
+        let graph = DepGraph::build(&config.services).unwrap();
+        let mut state = State::new(&config, 0);
+        let ctx = test_ctx(5);
+
+        let cmds = reduce(
+            &mut state,
+            Event::StartupProbeResults(vec![ProbeResult::Unhealthy {
+                service: ServiceId("ntfy".into()),
+                error: ProbeError::ConnectionRefused,
+                latency_ms: 1,
+            }]),
+            &config,
+            &graph,
+            &ctx,
+        );
+
+        assert_eq!(state.last_probe_cycle_mono, Some(ctx.mono_secs));
+        assert!(cmds.is_empty(), "startup observation must not emit commands");
+        assert!(matches!(
+            state.services[&ServiceId("ntfy".into())].status,
+            ServiceStatus::Unhealthy { .. }
+        ));
+    }
+
+    #[test]
+    fn startup_probe_results_block_dependents_without_restart() {
+        let config = test_config_with_dependency();
+        let graph = DepGraph::build(&config.services).unwrap();
+        let mut state = State::new(&config, 0);
+        let ctx = test_ctx(6);
+
+        let cmds = reduce(
+            &mut state,
+            Event::StartupProbeResults(vec![
+                ProbeResult::Unhealthy {
+                    service: ServiceId("unbound".into()),
+                    error: ProbeError::ConnectionRefused,
+                    latency_ms: 1,
+                },
+                ProbeResult::Unhealthy {
+                    service: ServiceId("ntfy".into()),
+                    error: ProbeError::ConnectionRefused,
+                    latency_ms: 1,
+                },
+            ]),
+            &config,
+            &graph,
+            &ctx,
+        );
+
+        assert!(cmds.is_empty(), "startup observation must not emit commands");
+        assert!(matches!(
+            state.services[&ServiceId("ntfy".into())].status,
+            ServiceStatus::BlockedByDep { ref root } if root.as_str() == "unbound"
+        ));
     }
 
     #[test]

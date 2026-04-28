@@ -10,11 +10,14 @@ CRATONCTL_PREVIOUS="/usr/local/bin/cratonctl.previous"
 SERVICE_NAME="cratond"
 
 log() {
-  echo "[install-remote] $*"
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] [install-remote] $*"
 }
 
 rollback() {
   log "Smoke-test failed, starting rollback"
+  log "Stopping $SERVICE_NAME before restoring previous binaries"
+  systemctl stop "$SERVICE_NAME"
+  sleep 1
 
   if [[ -f "$CRATOND_PREVIOUS" ]]; then
     cp "$CRATOND_PREVIOUS" "$CRATOND_BIN"
@@ -32,8 +35,8 @@ rollback() {
     log "Previous cratonctl binary not found, cratonctl rollback skipped"
   fi
 
-  systemctl restart "$SERVICE_NAME"
-  log "Rollback completed, service restart requested"
+  systemctl start "$SERVICE_NAME"
+  log "Rollback complete, previous version restored"
 }
 
 if [[ "${EUID}" -ne 0 ]]; then
@@ -73,16 +76,40 @@ chmod 755 "$CRATONCTL_BIN"
 log "Starting $SERVICE_NAME"
 systemctl start "$SERVICE_NAME"
 
-log "Running smoke-tests"
-if ! {
+log "Waiting for daemon to become healthy"
+HEALTHY=false
+for i in $(seq 1 15); do
   sleep 2
-  timeout 10s curl -sf http://127.0.0.1:18800/health >/dev/null
+  if curl -sf http://127.0.0.1:18800/health >/dev/null 2>&1; then
+    HEALTHY=true
+    log "Daemon healthy after $((i * 2)) seconds"
+    break
+  fi
+  log "Attempt ${i}/15: daemon not healthy yet..."
+done
+
+if [[ "$HEALTHY" != "true" ]]; then
+  log "ERROR: daemon did not become healthy within 30 seconds"
+  rollback
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] [install-remote] Smoke-test failed after deploy" >&2
+  exit 1
+fi
+
+log "Running cratonctl smoke-tests"
+if ! {
   timeout 10s "$CRATONCTL_BIN" health >/dev/null
+  timeout 10s "$CRATONCTL_BIN" status >/dev/null
+  timeout 10s "$CRATONCTL_BIN" services >/dev/null
 }; then
   rollback
-  echo "[install-remote] Smoke-test failed after deploy" >&2
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] [install-remote] CLI smoke-test failed after deploy" >&2
   exit 1
 fi
 
 log "Smoke-tests passed"
+echo ""
+log "=== Deploy successful ==="
+"$CRATONCTL_BIN" health
+"$CRATONCTL_BIN" status
+echo ""
 log "Install completed successfully"

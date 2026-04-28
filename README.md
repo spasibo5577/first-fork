@@ -1,386 +1,171 @@
-# Cratond
+# Craton
 
-`cratond` — systemd-ориентированный Rust-демон для мониторинга и управления домашним ARM64 сервером. Он следит за сервисами, запускает recovery, управляет backup FSM через `restic`, контролирует диск, хранит истории и отдаёт локальный HTTP API.
+Deterministic infrastructure supervision for a home ARM64 server.
 
-`cratonctl` — тонкий operator CLI поверх этого API. Он не редактирует state-файлы напрямую, не вызывает `systemctl` в обход демона и не обходит архитектуру демона.
+## What is Craton
 
-## Что есть в проекте
+Craton is a production-oriented Rust project for operating a self-hosted Linux server with systemd. It is built around `cratond`, a local daemon that monitors service health, applies dependency-aware recovery policy, runs a crash-safe backup state machine, watches disk pressure, and exposes a localhost HTTP API for operator tooling.
 
-- `cratond`:
-  - health monitoring сервисов
-  - recovery и controlled restart
-  - dependency-aware policy
-  - breaker / flapping control
-  - backup FSM с crash recovery
-  - disk monitoring и cleanup
-  - durable outbox для уведомлений
-  - maintenance mode
-  - remediation API с Bearer token
-  - histories и diagnose endpoint
-- `cratonctl`:
-  - read-only статус и истории
-  - `auth status` для прозрачной проверки auth/token readiness
-  - trigger задач
-  - maintenance / breaker / flapping команды
-  - backup run / unlock
-  - `doctor` preflight / sanity-check
-  - JSON-режим для автоматизации
+The project exists for the class of servers that are important enough to automate carefully, but small enough that complexity is a liability. The target environment is a home server or personal VPS where correctness, recoverability, and operator clarity matter more than feature sprawl.
 
-## Что это не делает
+`cratond` is paired with `cratonctl`, a thin operator CLI layered on top of the daemon API. The CLI does not edit daemon state files, does not bypass policy, and does not become a second controller. The daemon remains the source of truth.
 
-- не редактирует `backup-state.json`, `maintenance.json` и другие state-файлы вручную
-- не даёт второму клиенту стать отдельным контроллером системы
-- не предоставляет TUI, watch mode или autocomplete в текущем коде
-- не документирует ZeroClaw как готовую интеграцию: в конфиге сейчас есть AI-поля с `picoclaw_url`
-- не печатает Bearer token в help, status или JSON output
+## Architecture
 
-## Quick Start
+Craton is intentionally conservative:
 
-### 1. Собрать бинарники
+- Single-writer mutable state in the control loop
+- Reducer / effect separation
+- No shell execution, no async runtime, no plugin system
+- Deterministic, crash-safe, explainable behavior
+- Four long-lived threads, bounded queues and bounded histories
 
-Нативно:
+The formal specification lives in [docs/architecture/CONSTITUTION.md](docs/architecture/CONSTITUTION.md). The broader architectural walkthrough lives in [docs/architecture/ARCHITECTURE.md](docs/architecture/ARCHITECTURE.md).
 
-```bash
-cargo build --release --bin cratond --bin cratonctl
-```
+## Features
 
-Кросс-компиляция для ARM64:
+- Health monitoring with dependency-aware recovery
+- Circuit breaker and flapping control
+- Backup FSM with `restic` and startup crash recovery
+- Disk monitoring and cleanup
+- Durable `ntfy` outbox with replay on restart
+- Maintenance mode and breaker / flapping reset actions
+- Bearer-authenticated mutating API
+- systemd `sd_notify` and watchdog integration
+- Typed health endpoint and typed snapshot fields for operator tooling
 
-```bash
-rustup target add aarch64-unknown-linux-gnu
-cargo install cross
-cross build --release --target aarch64-unknown-linux-gnu --bin cratond --bin cratonctl
-```
+## cratonctl
 
-### 2. Подготовить сервер
+`cratonctl` is the operator CLI for `cratond`.
 
-```bash
-sudo mkdir -p /etc/craton /var/lib/craton /run/craton
-sudo install -m 0755 target/aarch64-unknown-linux-gnu/release/cratond /usr/local/bin/cratond
-sudo install -m 0755 target/aarch64-unknown-linux-gnu/release/cratonctl /usr/local/bin/cratonctl
-sudo install -m 0644 config.example.toml /etc/craton/config.toml
-sudo install -m 0644 deploy/cratond.service /etc/systemd/system/cratond.service
-sudo chmod 600 /etc/craton/config.toml
-```
-
-### 3. Отредактировать конфиг
-
-Проверь минимум:
-
-- `ntfy.url` и `ntfy.topic`
-- `backup.restic_repo`
-- `backup.restic_password_file`
-- `backup.paths`
-- список `[[service]]`
-- `service.unit`, `service.kind`, `service.probe`
-
-Актуальный пример лежит в [config.example.toml](config.example.toml).
-
-### 4. Запустить демон
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now cratond
-sudo systemctl status cratond
-```
-
-### 5. Сделать smoke-test
-
-```bash
-curl -s http://127.0.0.1:18800/health
-cratonctl health
-cratonctl auth status
-cratonctl status
-cratonctl doctor
-cratonctl services
-```
-
-## Бинарники
-
-- `cratond`: демон, читает `config.toml`, поднимает HTTP API и control loop
-- `cratonctl`: CLI-клиент к уже работающему `cratond`
-
-## `cratonctl`
-
-`cratonctl` использует только существующий HTTP API `cratond`.
-Это operator CLI, а не второй контроллер системы.
-
-URL resolution:
-
-1. `--url`
-2. `CRATONCTL_URL`
-3. `http://127.0.0.1:18800`
-
-Token resolution для mutating-команд:
-
-1. `--token`
-2. `CRATONCTL_TOKEN`
-3. `--token-file`
-4. `/var/lib/craton/remediation-token`
-
-Для безопасной проверки auth/token readiness используй:
-
-```bash
-cratonctl auth status
-cratonctl doctor
-```
-
-`auth status` показывает URL, порядок резолва токена, состояние token file и доступность mutating-команд.
-`doctor` дополняет это общим preflight по daemon/API и actionable advice.
-
-`cratonctl status` теперь также показывает:
-
-- тип запуска демона (`startup_kind`) в operator-friendly виде
-- предупреждение о деградации канала уведомлений только если есть проблема
-
-Поддерживаются:
-
-- human-readable output по умолчанию
-- `--json` для script-friendly automation
-- `--quiet` для краткого human output
-- `--no-color` для полного отключения цвета
-
-### Основные команды `cratonctl`
-
-Read-only:
+Common commands:
 
 ```bash
 cratonctl health
-cratonctl auth status
 cratonctl status
 cratonctl services
-cratonctl service ntfy
-cratonctl history recovery
-cratonctl history backup
-cratonctl history remediation
-cratonctl diagnose ntfy
 cratonctl doctor
-```
-
-Mutating:
-
-```bash
-cratonctl restart ntfy
-cratonctl maintenance set ntfy --reason "ручная диагностика"
-cratonctl maintenance clear ntfy
-cratonctl breaker clear ntfy
-cratonctl flapping clear ntfy
-cratonctl backup run
-cratonctl backup unlock
-cratonctl disk cleanup
 cratonctl trigger recovery
-cratonctl trigger backup
+cratonctl init
 ```
 
-Подробности: [docs/cratonctl.md](docs/cratonctl.md).
+Mutating commands require a Bearer token. Read-only commands do not.
 
-### Что `cratonctl` не делает
+Full reference: [docs/cratonctl.md](docs/cratonctl.md)
 
-- не редактирует daemon state вручную
-- не дублирует daemon policy
-- не предоставляет TUI, watch mode, completions или YAML output
-- не поддерживает `https://` в текущем CLI
-- не печатает токен и не делает mutating side effects в `doctor`/`auth status`
+## Installation
 
-## Конфиг
+### Prerequisites
 
-Формат: TOML. По умолчанию демон стартует так:
+- Rust toolchain
+- `aarch64-unknown-linux-gnu` target for ARM64 deploys
+- `cargo-zigbuild` for cross-compilation from x86_64 Windows/Linux hosts
+- ARM64 Linux server with systemd
+
+### First-time setup
+
+For a fresh server, install the binaries and run:
 
 ```bash
-cratond /etc/craton/config.toml
+sudo cratonctl init
 ```
 
-Ключевые секции:
+This prepares:
 
-- `[daemon]`: адрес API, watchdog, уровень логов
-- `[ntfy]`: доставка operator-facing alert'ов
-- `[backup]` и `[backup.retention]`: расписание и параметры `restic`
-- `[disk]`: пороги warning / critical
-- `[updates]`: scheduled tasks
-- `[ai]`: текущие AI-поля, включая `picoclaw_url`
-- `[[service]]`: сервисы, probe, dependencies, breaker, backup_stop
-
-Пример:
-
-```toml
-[daemon]
-listen = "127.0.0.1:18800"
-watchdog = true
-log_level = "info"
-
-[[service]]
-id = "ntfy"
-name = "NTFY"
-unit = "ntfy.service"
-kind = "systemd"
-severity = "critical"
-
-[service.probe]
-type = "http"
-url = "http://127.0.0.1:8080/v1/health"
-timeout_secs = 5
-expect_status = 200
-```
-
-Для реального деплоя ориентируйся на [config.example.toml](config.example.toml).
-
-## Systemd unit
-
-Готовый unit: [deploy/cratond.service](deploy/cratond.service).
-
-Текущий unit использует:
-
-- `Type=notify`
-- `ExecStart=/usr/local/bin/cratond /etc/craton/config.toml`
-- `WatchdogSec=30`
-- `StateDirectory=craton`
-- `RuntimeDirectory=craton`
-- `LogsDirectory=craton`
-
-Подробный деплой: [docs/deploy.md](docs/deploy.md).
-
-## HTTP API overview
-
-Read-only:
-
-- `GET /health`
-- `GET /api/v1/state`
-- `GET /api/v1/history/recovery`
-- `GET /api/v1/history/backup`
-- `GET /api/v1/history/remediation`
-- `GET /api/v1/diagnose/{service}`
-
-Mutating:
-
-- `POST /trigger/{task}`
-- `POST /api/v1/remediate`
-
-### `/health`
-
-`/health` — typed health endpoint демона, а не summary всех degraded сервисов.
-
-- `200 {"status":"ok","reason":"ok"}` если snapshot свежий, overflow нет и shutdown не идёт
-- `503 {"status":"unavailable","reason":"stale_snapshot"}` если control loop не публикует свежий snapshot
-- `503 {"status":"unavailable","reason":"outbox_overflow"}` если durable outbox переполнен
-- `503 {"status":"unavailable","reason":"shutting_down"}` если daemon завершает работу
-
-### `/api/v1/state`
-
-Возвращает полный snapshot-объект, включая:
-
-- `services`
-- `backup_phase`
-- `disk_usage_percent`
-- `startup_kind`
-- `notify_degraded`
-- `notify_consecutive_failures`
-- `notify_last_success_epoch_secs`
-- `notify_last_failure_epoch_secs`
-- `backup_history`
-- `recovery_history`
-- `remediation_history`
-- `snapshot_epoch_secs`
-- `outbox_overflow`
-- `shutting_down`
-
-## Remediation overview
-
-Mutating API требует Bearer token из файла `/var/lib/craton/remediation-token`, если в конфиге не задан другой `ai.token_path`.
-
-`cratonctl` для mutating-команд использует этот токен автоматически, если он доступен.
-Read-only команды не требуют токен.
-
-Пример raw API:
-
-```bash
-TOKEN="$(cat /var/lib/craton/remediation-token)"
-curl -sS -X POST http://127.0.0.1:18800/api/v1/remediate \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"action":"RestartService","target":"ntfy","reason":"ручная диагностика"}'
-```
-
-Поддерживаемые action'ы:
-
-- `RestartService`
-- `DockerRestart`
-- `TriggerBackup`
-- `MarkMaintenance`
-- `ClearMaintenance`
-- `ClearBreaker`
-- `ClearFlapping`
-- `RunDiskCleanup`
-- `ResticUnlock`
-
-Rate limits в текущем коде:
-
-- `RestartService`: 3 в час на сервис
-- `DockerRestart`: 1 в час
-- `TriggerBackup`: 1 в сутки
-- `MarkMaintenance`: 5 в час
-
-## Backup / recovery overview
-
-Recovery:
-
-- unhealthy сервис может быть рестартован
-- `BlockedByDep` не рестартуется, пока не восстановится зависимость
-- breaker и cooldown ограничивают повторные рестарты
-- maintenance подавляет auto-remediation
-
-Backup FSM:
-
-- optional `restic unlock`
-- остановка сервисов с `backup_stop = true`
-- `restic backup`
-- retention
-- optional verify
-- возврат сервисов в исходное состояние
-- crash recovery по `backup-state.json`
-
-## Deploy basics
-
-Практический минимум:
-
-1. собрать `cratond` и `cratonctl`
-2. установить `config.toml`
-3. установить `deploy/cratond.service`
-4. проверить `restic`, `systemctl`, `journalctl`, `ntfy`
-5. запустить `systemctl enable --now cratond`
-6. проверить `/health`, `cratonctl status`, `cratonctl history backup`
-
-Для первого operator onboarding после деплоя также полезно сразу проверить:
-
-```bash
-cratonctl auth status
-cratonctl doctor
-```
-
-## Файлы на диске
-
-- `/usr/local/bin/cratond`
-- `/usr/local/bin/cratonctl`
 - `/etc/craton/config.toml`
-- `/var/lib/craton/backup-state.json`
-- `/var/lib/craton/maintenance.json`
-- `/var/lib/craton/alert-outbox.jsonl`
 - `/var/lib/craton/remediation-token`
-- `/run/craton/llm_context.json`
+- `/etc/systemd/system/cratond.service`
+- runtime and state directories
 
-## Ограничения и нецели
+It does not start or enable the daemon automatically.
 
-- API рассчитан на localhost и не предоставляет TLS
-- `cratonctl` не реализует TUI
-- `cratonctl` не имеет watch mode в текущем коде
-- `cratonctl` не поддерживает `https://` и работает только через daemon HTTP API
-- поля `[ai]` в конфиге существуют, но это не означает готовую ZeroClaw integration
-- архитектурный источник истины остаётся в `docs/architecture/CONSTITUTION.md`
+### Deploy
 
-## Дополнительные документы
+This repository includes deploy helpers:
 
+- [scripts/deploy.ps1](scripts/deploy.ps1) for Windows / PowerShell
+- [scripts/install-remote.sh](scripts/install-remote.sh) for the Linux server
+
+Detailed deploy instructions: [docs/deploy.md](docs/deploy.md)
+
+## Configuration
+
+The main config file is:
+
+```text
+/etc/craton/config.toml
+```
+
+Primary sections:
+
+- `[daemon]`
+- `[ntfy]`
+- `[backup]`
+- `[backup.retention]`
+- `[disk]`
+- `[updates]`
+- `[ai]`
+- `[[service]]`
+- `[service.probe]`
+
+Reference example: [config.example.toml](config.example.toml)
+
+Formal behavioral contracts are documented in [docs/architecture/CONSTITUTION.md](docs/architecture/CONSTITUTION.md).
+
+## API
+
+`cratond` binds to `127.0.0.1:18800` by default.
+
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| `GET` | `/health` | No | Typed daemon health |
+| `GET` | `/api/v1/state` | No | Current snapshot |
+| `GET` | `/api/v1/history/recovery` | No | Recovery history |
+| `GET` | `/api/v1/history/backup` | No | Backup history |
+| `GET` | `/api/v1/history/remediation` | No | Remediation history |
+| `GET` | `/api/v1/diagnose/{service}` | No | Service diagnostics for configured services only |
+| `POST` | `/trigger/{task}` | Bearer | Trigger daemon task |
+| `POST` | `/api/v1/remediate` | Bearer | Request remediation action |
+
+Mutating endpoints no longer return `202 Accepted`. They now wait for control-loop acknowledgement and return:
+
+- `200` when the request was accepted by daemon policy
+- `409` when policy rejects the request
+- `503` when the control loop is unavailable
+- `504` when the control loop does not acknowledge in time
+
+`/health` now checks:
+
+- snapshot freshness
+- outbox overflow
+- probe-cycle freshness
+- shutdown state
+- daemon degradation reasons
+
+## Runtime and Safety Notes
+
+- Existing remediation token read failures are fatal on startup
+- Missing runtime/state directories are fatal on startup
+- Signal adapter startup failure is fatal
+- Critical file writes require directory `fsync`; rename without directory sync is not treated as success
+- Bearer token comparison is constant-time
+- `/api/v1/state` no longer exposes `start_mono`
+- Snapshot includes `startup_kind` and notification channel status fields
+
+## Project Status
+
+Deployed and running in production on a home ARM64 server. Current work is focused on hardening, operator UX, and documentation accuracy rather than broad feature expansion.
+
+## Documentation
+
+- [docs/architecture/CONSTITUTION.md](docs/architecture/CONSTITUTION.md)
+- [docs/architecture/ARCHITECTURE.md](docs/architecture/ARCHITECTURE.md)
 - [docs/cratonctl.md](docs/cratonctl.md)
 - [docs/deploy.md](docs/deploy.md)
-- [docs/design/CRATONCTL_DESIGN.md](docs/design/CRATONCTL_DESIGN.md)
-- [docs/handoffs/HANDOFF_FOR_CRATONCTL.md](docs/handoffs/HANDOFF_FOR_CRATONCTL.md)
+- [OPERATOR.md](OPERATOR.md)
 
+## License
 
+MIT
+
+## Crafted by Cherry 🍒

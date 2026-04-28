@@ -320,6 +320,10 @@ pub enum Event {
     /// Scheduler determined these tasks are due.
     Tick { due_tasks: Vec<TaskKind> },
 
+    /// Early startup observation pass. Populates service state and health data
+    /// without triggering recovery actions.
+    StartupProbeResults(Vec<ProbeResult>),
+
     /// Health probes completed.
     ProbeResults(Vec<ProbeResult>),
 

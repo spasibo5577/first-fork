@@ -1,46 +1,22 @@
 # cratonctl
 
-`cratonctl` — операторский CLI для `cratond`. Это тонкий клиент к локальному
-HTTP API демона. Он не редактирует state-файлы напрямую, не вызывает
-`systemctl` как обходной путь и не дублирует daemon policy.
+`cratonctl` — тонкий operator CLI для `cratond`.
 
-## Назначение
+Он работает только через HTTP API демона и не:
 
-`cratonctl` нужен для трёх основных задач:
-
-- быстро посмотреть состояние демона и сервисов
-- быстро понять, готов ли mutating path по auth/token
-- вручную инициировать safe actions через уже существующий policy слой `cratond`
-- получать machine-readable JSON для скриптов и автоматизации
-
-Anti-goals:
-
-- не становиться вторым контроллером системы
-- не редактировать `maintenance.json`, `backup-state.json` и другие state-файлы
-- не предоставлять TUI, watch mode, shell completions, YAML/XML output
-- не поддерживать `https://` в текущем CLI
-
-## Как он работает
-
-`cratonctl` использует только текущие HTTP endpoints:
-
-- `GET /health`
-- `GET /api/v1/state`
-- `GET /api/v1/history/recovery`
-- `GET /api/v1/history/backup`
-- `GET /api/v1/history/remediation`
-- `GET /api/v1/diagnose/{service}`
-- `POST /trigger/{task}`
-- `POST /api/v1/remediate`
+- редактирует state-файлы напрямую
+- вызывает `systemctl` в обход демона
+- дублирует daemon policy
+- становится вторым контроллером системы
 
 ## Глобальные флаги
 
-- `--url <url>`: базовый URL демона
-- `--token <token>`: Bearer token для mutating-команд
-- `--token-file <path>`: путь к файлу токена
-- `--json`: JSON output вместо human-readable текста
-- `--quiet`: короткий human output
-- `--no-color`: полностью отключить цветной human-readable output
+- `--url <url>` — базовый URL демона
+- `--token <token>` — Bearer token для mutating-команд
+- `--token-file <path>` — читать токен из файла
+- `--json` — печатать один JSON document
+- `--quiet` — минимизировать human-readable вывод
+- `--no-color` — отключить цветной вывод
 
 ## Разрешение URL и токена
 
@@ -52,7 +28,7 @@ Anti-goals:
 2. `CRATONCTL_URL`
 3. `http://127.0.0.1:18800`
 
-В текущем MVP поддерживается только `http://`.
+Поддерживается только `http://`.
 
 ### Bearer token
 
@@ -60,39 +36,17 @@ Anti-goals:
 
 1. `--token`
 2. `CRATONCTL_TOKEN`
-3. `--token-file <path>`
-4. autodiscovery: `/var/lib/craton/remediation-token`
+3. `--token-file`
+4. `/var/lib/craton/remediation-token`
 
-Read-only команды могут работать без токена. Mutating-команды без токена
-завершаются ошибкой auth/config.
+Read-only команды работают без токена.  
+Mutating-команды без токена завершаются ошибкой.
 
-CLI различает:
-
-- token not provided
-- explicit token file missing
-- token file unreadable
-- token file invalid or empty
-
-Для прозрачной диагностики auth path:
-
-```bash
-cratonctl auth status
-```
-
-Эта команда показывает:
-
-- daemon URL
-- token resolution order
-- autodiscovery token path
-- token file exists / missing / unreadable / invalid
-- mutating commands available: yes/no
-- human-readable explanation why not
-
-## Read-only команды
+## Команды
 
 ### `cratonctl health`
 
-Показывает typed health самого демона.
+Проверить health демона.
 
 HTTP:
 
@@ -105,37 +59,36 @@ cratonctl health
 cratonctl --json health
 ```
 
-Ожидаемый human output:
-
-```text
-ok
-```
-
-или
-
-```text
-unavailable: stale_snapshot
-```
-
 Exit codes:
 
-- `0`: daemon healthy
-- `1`: daemon unavailable
-- `2`: локальная ошибка клиента, транспорта или парсинга
+- `0` — daemon healthy
+- `1` — daemon unavailable
+- `2` — локальная ошибка клиента / auth / parse / transport
+
+### `cratonctl auth status`
+
+Проверить URL, token resolution и mutating readiness без побочных эффектов.
+
+Примеры:
+
+```bash
+cratonctl auth status
+cratonctl auth status --token-file /var/lib/craton/remediation-token
+cratonctl --json auth status
+```
 
 ### `cratonctl status`
 
 Краткий summary:
 
 - health
-- startup kind
-- количество сервисов
+- число сервисов
 - число degraded сервисов
 - backup phase
 - disk usage
-- notifications summary
-- `shutting_down`
+- `startup_kind`
 - `outbox_overflow`
+- notify degradation
 
 HTTP:
 
@@ -150,11 +103,11 @@ cratonctl --quiet status
 cratonctl --json status
 ```
 
-Human-readable status дополнительно:
+Exit codes:
 
-- показывает `startup_kind` как короткую operator-friendly строку вроде `Host reboot` или `Daemon restart`
-- показывает состояние notifier только если канал деградировал, например `Notifications: DEGRADED (5 consecutive failures)`
-- не пытается превращать notify timestamps в отдельный экран мониторинга
+- `0` — daemon reachable and command succeeded
+- `1` — daemon unhealthy
+- `2` — локальная ошибка клиента
 
 ### `cratonctl services`
 
@@ -164,11 +117,12 @@ HTTP:
 
 - `GET /api/v1/state`
 
-Колонки:
+Примеры:
 
-- `SERVICE`
-- `STATUS`
-- `SUMMARY`
+```bash
+cratonctl services
+cratonctl --json services
+```
 
 ### `cratonctl service <id>`
 
@@ -178,97 +132,150 @@ HTTP:
 
 - `GET /api/v1/state`
 
-Показывает:
+Примеры:
 
-- `service`
-- `status`
-- `summary`
-- дополнительные поля для `suppressed`, `blocked_by_dep`, `unhealthy`
-
-В human-readable output raw monotonic поля не показываются.
-В `--json` они остаются как есть, если пришли из daemon API.
+```bash
+cratonctl service ntfy
+cratonctl --json service ntfy
+```
 
 ### `cratonctl history recovery`
+### `cratonctl history backup`
+### `cratonctl history remediation`
+
+История daemon-side событий.
 
 HTTP:
 
 - `GET /api/v1/history/recovery`
-
-### `cratonctl history backup`
-
-HTTP:
-
 - `GET /api/v1/history/backup`
-
-### `cratonctl history remediation`
-
-HTTP:
-
 - `GET /api/v1/history/remediation`
+
+Примеры:
+
+```bash
+cratonctl history recovery
+cratonctl history backup
+cratonctl history remediation
+cratonctl --json history backup
+```
 
 ### `cratonctl diagnose <service>`
 
-Daemon-side диагностика по `systemctl` и `journalctl`.
+Попросить daemon-side диагностику для сервиса.
 
 HTTP:
 
 - `GET /api/v1/diagnose/{service}`
 
-Показывает:
+Важно:
 
-- имя сервиса
-- unit
-- active yes/no
-- `systemctl status`
-- последние 50 строк journal
+- сервис должен существовать в конфиге демона
+- неизвестный сервис -> daemon-side error
+
+Примеры:
+
+```bash
+cratonctl diagnose ntfy
+cratonctl --json diagnose ntfy
+```
 
 ### `cratonctl doctor`
 
-Безопасный preflight для оператора.
+Безопасный preflight без mutating requests.
 
-Проверяет только:
+Проверяет:
 
 - reachable ли daemon URL
-- отвечает ли `GET /health`
-- отвечает и парсится ли `GET /api/v1/state`
-- доступен ли token path для mutating commands
-- готовы ли базовые preconditions для read-only и mutating paths
+- отвечает ли `/health`
+- отвечает ли `/api/v1/state`
+- доступен ли token path
+- готовы ли read-only и mutating paths
 
-`doctor` не делает mutating requests и ничего не исправляет автоматически.
-Он дополняет `auth status`, а не заменяет его:
+Примеры:
 
-- `auth status` отвечает на вопрос "почему mutating path доступен или нет"
-- `doctor` отвечает на вопрос "готовы ли daemon/API/auth preconditions в целом"
+```bash
+cratonctl doctor
+cratonctl --json doctor
+```
 
-В human-readable output `doctor` также даёт краткий actionable advice, например:
+Exit codes:
 
-- проверить `--url`
-- использовать `--token`, `CRATONCTL_TOKEN` или `--token-file`
-- исправить права на token file
-- запустить `cratonctl auth status` для детального auth breakdown
+- `0` — нет fail checks
+- `1` — есть fail checks
+- `2` — локальная ошибка клиента
 
-## Mutating команды
+### `cratonctl init`
 
-Все mutating-команды требуют Bearer token.
+Первичная инициализация сервера.
+
+Что делает:
+
+- требует root
+- создаёт config dir, state dir, runtime dir
+- создаёт `config.toml`, если его ещё нет
+- создаёт remediation token, если его ещё нет
+- создаёт systemd unit, если его ещё нет
+- запускает `systemctl daemon-reload`, если unit был создан
+
+Что не делает:
+
+- не стартует daemon
+- не включает daemon в autostart
+- не перезаписывает существующие config/token/unit файлы
+
+Флаги:
+
+- `--non-interactive`
+- `--config-dir <path>`
+- `--state-dir <path>`
+
+Примеры:
+
+```bash
+sudo cratonctl init
+sudo cratonctl init --non-interactive
+sudo cratonctl init --config-dir /tmp/craton/etc --state-dir /tmp/craton/state
+sudo cratonctl --json init --non-interactive
+```
 
 ### `cratonctl trigger <task>`
 
-Запускает scheduled task вне расписания.
+Запустить daemon task вне расписания.
 
 HTTP:
 
 - `POST /trigger/{task}`
+
+Auth:
+
+- Bearer token обязателен
+
+Частые task names:
+
+- `recovery`
+- `backup`
+- `disk-monitor`
+- `apt-updates`
+- `docker-updates`
+- `daily-summary`
 
 Примеры:
 
 ```bash
 cratonctl trigger recovery
 cratonctl trigger backup
-cratonctl trigger recovery --token-file /var/lib/craton/remediation-token
+cratonctl trigger daily-summary --token-file /var/lib/craton/remediation-token
 ```
 
-Поддерживаемые task names определяются daemon-side scheduler/API.
-CLI не валидирует и не ограничивает их отдельным локальным списком.
+Response semantics:
+
+- `200` — daemon принял запрос
+- `409` — policy rejection
+- `503` — control loop unavailable
+- `504` — control loop did not respond in time
+
+`202` больше не используется.
 
 ### `cratonctl restart <service>`
 
@@ -276,33 +283,49 @@ HTTP:
 
 - `POST /api/v1/remediate`
 
-JSON body:
+Action:
 
-```json
-{
-  "action": "RestartService",
-  "target": "ntfy"
-}
+- `RestartService`
+
+Примеры:
+
+```bash
+cratonctl restart ntfy
+cratonctl restart ntfy --token-file /var/lib/craton/remediation-token
 ```
 
-### `cratonctl maintenance set <service> --reason "..."`
+### `cratonctl docker restart <container>`
 
 HTTP:
 
 - `POST /api/v1/remediate`
 
-JSON body:
+Action:
 
-```json
-{
-  "action": "MarkMaintenance",
-  "target": "ntfy",
-  "reason": "ручная диагностика"
-}
+- `DockerRestart`
+
+Примеры:
+
+```bash
+cratonctl docker restart continuwuity
+cratonctl docker restart continuwuity --token-file /var/lib/craton/remediation-token
 ```
 
-Важно: в текущей реализации CLI нет `--for`. Duration maintenance
-определяется политикой демона, а не флагом CLI.
+### `cratonctl maintenance set <service> --reason <text>`
+
+HTTP:
+
+- `POST /api/v1/remediate`
+
+Action:
+
+- `MarkMaintenance`
+
+Примеры:
+
+```bash
+cratonctl maintenance set ntfy --reason "ручная диагностика"
+```
 
 ### `cratonctl maintenance clear <service>`
 
@@ -310,11 +333,23 @@ Action:
 
 - `ClearMaintenance`
 
+Примеры:
+
+```bash
+cratonctl maintenance clear ntfy
+```
+
 ### `cratonctl breaker clear <service>`
 
 Action:
 
 - `ClearBreaker`
+
+Примеры:
+
+```bash
+cratonctl breaker clear ntfy
+```
 
 ### `cratonctl flapping clear <service>`
 
@@ -322,13 +357,26 @@ Action:
 
 - `ClearFlapping`
 
+Примеры:
+
+```bash
+cratonctl flapping clear ntfy
+```
+
 ### `cratonctl backup run`
 
-Эквивалент `trigger backup`.
+Это alias поверх trigger path.
 
 HTTP:
 
 - `POST /trigger/backup`
+
+Примеры:
+
+```bash
+cratonctl backup run
+cratonctl --json backup run
+```
 
 ### `cratonctl backup unlock`
 
@@ -340,6 +388,12 @@ Action:
 
 - `ResticUnlock`
 
+Примеры:
+
+```bash
+cratonctl backup unlock
+```
+
 ### `cratonctl disk cleanup`
 
 HTTP:
@@ -350,28 +404,74 @@ Action:
 
 - `RunDiskCleanup`
 
+Примеры:
+
+```bash
+cratonctl disk cleanup
+```
+
+## Auth requirements
+
+Read-only команды без токена:
+
+- `health`
+- `auth status`
+- `status`
+- `services`
+- `service <id>`
+- `history *`
+- `diagnose <service>`
+- `doctor`
+
+Mutating-команды с токеном:
+
+- `trigger <task>`
+- `restart <service>`
+- `docker restart <container>`
+- `maintenance set|clear`
+- `breaker clear`
+- `flapping clear`
+- `backup run`
+- `backup unlock`
+- `disk cleanup`
+
+## HTTP response semantics
+
+### Trigger
+
+`POST /trigger/{task}`:
+
+- `200` — accepted by daemon
+- `401` — unauthorized
+- `404` — unknown task
+- `409` — rejected by policy
+- `503` — control loop unavailable
+- `504` — control loop timeout
+
+### Remediation
+
+`POST /api/v1/remediate`:
+
+- `200` — accepted by daemon
+- `401` — unauthorized
+- `400` — invalid JSON / unknown action / malformed body
+- `409` — rejected by policy
+- `500` — internal ACK error
+- `503` — control loop unavailable
+- `504` — control loop timeout
+
 ## JSON mode
 
-Используй `--json`, если:
+`--json` печатает один JSON document в stdout.
 
-- команду читает скрипт
-- нужен стабильный объект/массив для `jq`
-- важно отделить stdout от stderr
-
-Поведение:
-
-- stdout содержит один JSON document
-- ошибки тоже выводятся JSON-объектом в stdout, если передан `--json`
-- stderr в JSON mode не используется для обычных ошибок команды
-
-Пример ошибки:
+Если CLI падает локально, формат ошибки будет таким:
 
 ```json
 {
   "error": {
     "kind": "auth",
-    "code": "token_file_unreadable",
-    "message": "authentication error: token file is not readable: /var/lib/craton/remediation-token (permission denied)",
+    "code": "token_not_provided",
+    "message": "token required for mutating command; use --token, CRATONCTL_TOKEN, or --token-file",
     "exit_code": 2
   }
 }
@@ -379,68 +479,19 @@ Action:
 
 ## Exit codes
 
-- `0`: успех
-- `1`: daemon-side ошибка или отказ
-- `2`: invalid arguments, config error, transport error, parse error
+- `0` — success
+- `1` — daemon-side rejection / unavailable / unhealthy result
+- `2` — local usage / config / auth / transport / parse error
 
-Практически это значит:
+Примечание:
 
-- `health` возвращает `1`, если daemon unhealthy
-- `service <id>` вернёт `1`, если сервис не найден
-- проблемы URL, токена, TCP connection или JSON parsing вернут `2`
-
-## Примеры
-
-### Проверить демон
-
-```bash
-cratonctl health
-cratonctl auth status
-cratonctl status
-cratonctl doctor
-```
-
-### Получить JSON для автоматизации
-
-```bash
-cratonctl --json services
-cratonctl --json history backup
-cratonctl --json service ntfy
-```
-
-### Ручная диагностика
-
-```bash
-cratonctl diagnose continuwuity
-cratonctl maintenance set continuwuity --reason "ручная проверка после обновления"
-cratonctl restart continuwuity
-cratonctl maintenance clear continuwuity
-```
-
-### Работа с backup
-
-```bash
-cratonctl backup run
-cratonctl --json history backup
-cratonctl backup unlock
-```
+- `health` возвращает `1`, если daemon отвечает, но unhealthy
+- `status` возвращает `1`, если daemon reachable, но health не `ok`
+- `doctor` возвращает `1`, если есть failed checks
 
 ## Ограничения
 
-- нет TUI
-- нет watch mode
-- нет autocomplete
-- нет YAML output
-- нет HTTPS client support в MVP
-- `doctor` — это safe preflight, а не full integration test
-- CLI не вычисляет wall-clock age из raw monotonic daemon fields
-- branding/banner появляются только в onboarding/help paths и не должны мешать script-friendly usage
-
-## Что planned / future
-
-Ниже перечислено как возможное развитие, но не как текущая функциональность:
-
-- watch mode
-- shell completions
-- более богатое форматирование вывода
-- дополнительные безопасные helper-команды для bulk inspection
+- CLI не поддерживает `https://`
+- CLI не редактирует daemon state-файлы напрямую
+- CLI не пытается “умно чинить” систему за спиной демона
+- CLI не печатает Bearer token

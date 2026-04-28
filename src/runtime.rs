@@ -83,6 +83,19 @@ pub fn run_control_loop(
         );
     }
 
+    run_startup_probe_cycle(
+        config,
+        graph,
+        &mut state,
+    );
+    publish_snapshot(
+        &state,
+        startup_kind,
+        &snapshot,
+        &outbox_overflow,
+        &notify_runtime_state,
+    );
+
     // Signal ready.
     sd_notify.ready();
     sd_notify.status("running");
@@ -503,6 +516,33 @@ fn exec_run_probes(
     execute_commands(
         &sub_cmds, config, graph, notifier, snapshot, state, sd_notify, event_tx,
     );
+}
+
+fn run_startup_probe_cycle(
+    config: &CratonConfig,
+    graph: &DepGraph,
+    state: &mut State,
+) {
+    let service_ids: Vec<ServiceId> = state.services.keys().cloned().collect();
+    if service_ids.is_empty() {
+        return;
+    }
+
+    crate::log::info(
+        "runtime",
+        &format!("running early startup probe for {} services", service_ids.len()),
+    );
+    let results = run_probes(&service_ids, config, state);
+    let ctx = make_ctx();
+    let cmds = reduce::reduce(state, Event::StartupProbeResults(results), config, graph, &ctx);
+    if !cmds.is_empty() {
+        mark_runtime_degraded(
+            state,
+            "startup_probe_emitted_commands",
+            "startup probe unexpectedly emitted commands",
+        );
+    }
+    debug_assert!(cmds.is_empty(), "startup probe must stay observe-only");
 }
 
 fn mark_runtime_degraded(state: &mut State, reason: &str, message: &str) {

@@ -1,272 +1,229 @@
 # Deploy Guide
 
-Этот документ описывает практический деплой `cratond` и `cratonctl` на
-домашний ARM64 Linux сервер.
+Этот документ описывает актуальный деплой `cratond` и `cratonctl` на ARM64 Linux сервер с systemd.
 
-## Что должно быть на сервере
+## Что есть в репозитории
 
-Минимум:
+- [scripts/deploy.ps1](../scripts/deploy.ps1) — локальный Windows / PowerShell deploy helper
+- [scripts/install-remote.sh](../scripts/install-remote.sh) — серверный install script
+- [deploy/cratond.service](../deploy/cratond.service) — systemd unit
+- [config.example.toml](../config.example.toml) — пример конфига
 
-- Linux с `systemd`
-- `restic`
-- `systemctl`
-- `journalctl`
-- доступ к `ntfy`, если уведомления включены
+## Prerequisites
 
-В зависимости от probe и сервисов также могут быть нужны:
+Локально:
 
-- `tailscale`
-- `docker`
-- DNS/HTTP сервисы из конфига
-
-## Сборка
-
-### Нативная сборка
-
-Если собираешь прямо на целевой машине:
-
-```bash
-cargo build --release --bin cratond --bin cratonctl
-```
-
-### Кросс-компиляция для ARM64
-
-Если собираешь с x86_64 хоста:
-
-```bash
-rustup target add aarch64-unknown-linux-gnu
-cargo install cross
-cross build --release --target aarch64-unknown-linux-gnu --bin cratond --bin cratonctl
-```
-
-Ожидаемые бинарники:
-
-- `target/aarch64-unknown-linux-gnu/release/cratond`
-- `target/aarch64-unknown-linux-gnu/release/cratonctl`
-
-## Копирование на сервер
-
-```bash
-scp target/aarch64-unknown-linux-gnu/release/cratond server:/tmp/cratond
-scp target/aarch64-unknown-linux-gnu/release/cratonctl server:/tmp/cratonctl
-scp config.example.toml server:/tmp/config.toml
-scp deploy/cratond.service server:/tmp/cratond.service
-```
+- Rust toolchain
+- target `aarch64-unknown-linux-gnu`
+- `cargo-zigbuild`
+- Zig
+- `ssh` и `scp`
 
 На сервере:
 
+- ARM64 Linux
+- systemd
+- `curl`
+- `systemctl`
+- `timeout`
+
+## First-time setup
+
+После установки бинарников на новый сервер:
+
 ```bash
-sudo install -m 0755 /tmp/cratond /usr/local/bin/cratond
-sudo install -m 0755 /tmp/cratonctl /usr/local/bin/cratonctl
-sudo install -d -m 0755 /etc/craton
-sudo install -d -m 0700 /var/lib/craton
-sudo install -d -m 0755 /run/craton
-sudo install -m 0600 /tmp/config.toml /etc/craton/config.toml
-sudo install -m 0644 /tmp/cratond.service /etc/systemd/system/cratond.service
+sudo cratonctl init
 ```
 
-## Настройка `config.toml`
+`cratonctl init`:
 
-Не копируй пример без правок в production. Перед запуском проверь:
+- создаёт `/etc/craton`
+- создаёт `/var/lib/craton`
+- создаёт `/run/craton`
+- пишет `/etc/craton/config.toml`, если файла ещё нет
+- создаёт `/var/lib/craton/remediation-token`, если файла ещё нет
+- ставит `/etc/systemd/system/cratond.service`, если файла ещё нет
+- делает `systemctl daemon-reload`, если unit был создан
 
-- `daemon.listen`
-- `ntfy.url`
-- `ntfy.topic`
-- `backup.restic_repo`
-- `backup.restic_password_file`
-- `backup.paths`
-- `updates.*`
-- `service.unit`
-- `service.depends_on`
-- `service.probe`
+После этого:
 
-Если используешь AI-секцию:
+1. вручную проверить `config.toml`
+2. включить и запустить daemon
 
-- текущий код использует поле `picoclaw_url`
-- не документируй это как ZeroClaw integration, если у тебя её нет в коде
+```bash
+sudo systemctl enable --now cratond
+```
 
-## Установка systemd unit
+## Automated deploy from Windows
 
-Актуальный unit в репозитории:
+Запуск:
+
+```powershell
+pwsh -File .\scripts\deploy.ps1
+```
+
+### Что делает `scripts/deploy.ps1`
+
+Скрипт:
+
+1. добавляет Zig в `PATH`
+2. запускает:
+
+```powershell
+cargo zigbuild --release --target aarch64-unknown-linux-gnu --bin cratond --bin cratonctl
+```
+
+3. проверяет, что бинарники существуют в:
+
+```text
+target\aarch64-unknown-linux-gnu\release\
+```
+
+4. копирует:
+   - `cratond` -> `/tmp/cratond.new`
+   - `cratonctl` -> `/tmp/cratonctl.new`
+   - `install-remote.sh` -> `/tmp/install-remote.sh`
+5. запускает удалённый install через:
+
+```text
+ssh user@host "sudo bash /tmp/install-remote.sh"
+```
+
+### Что настраивается в начале `deploy.ps1`
+
+- путь к Zig
+- target triple
+- SSH user / host
+- remote temporary paths
+
+## Remote install on the server
+
+Запускается через `deploy.ps1`, но можно вызвать и вручную:
+
+```bash
+sudo bash /tmp/install-remote.sh
+```
+
+### Что делает `scripts/install-remote.sh`
+
+Скрипт:
+
+1. проверяет наличие `/tmp/cratond.new` и `/tmp/cratonctl.new`
+2. делает backup текущих бинарников в:
+   - `/usr/local/bin/cratond.previous`
+   - `/usr/local/bin/cratonctl.previous`
+3. останавливает `cratond`
+4. ставит новые бинарники в `/usr/local/bin`
+5. запускает `cratond`
+6. делает smoke-test:
+   - `curl -sf http://127.0.0.1:18800/health`
+   - `cratonctl health`
+7. если smoke-test не прошёл — откатывает бинарники назад
+
+Скрипт не трогает:
+
+- `config.toml`
+- state files
+- remediation token
+- systemd unit
+
+## Manual deploy
+
+Если automation не подходит:
+
+1. собрать бинарники
+2. скопировать их на сервер
+3. остановить daemon
+4. заменить бинарники
+5. запустить daemon
+6. прогнать smoke-test
+
+Пример:
+
+```bash
+sudo systemctl stop cratond
+sudo install -m 0755 /tmp/cratond /usr/local/bin/cratond
+sudo install -m 0755 /tmp/cratonctl /usr/local/bin/cratonctl
+sudo systemctl start cratond
+curl -sf http://127.0.0.1:18800/health
+cratonctl health
+cratonctl status
+```
+
+## systemd unit
+
+Актуальный unit:
 
 - [deploy/cratond.service](../deploy/cratond.service)
 
-Ключевые параметры текущего unit:
+Ключевые свойства:
 
 - `Type=notify`
 - `ExecStart=/usr/local/bin/cratond /etc/craton/config.toml`
+- `Restart=on-failure`
 - `WatchdogSec=30`
 - `RuntimeDirectory=craton`
 - `StateDirectory=craton`
 - `LogsDirectory=craton`
 
-Проверь, что права и пути соответствуют твоему окружению:
+## Smoke test checklist
 
-- `/var/lib/craton`
-- `/run/craton`
-- путь к `restic_password_file`
-- путь к возможному AI state
-
-## Запуск
+После первого запуска или обновления:
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now cratond
-sudo systemctl status cratond
-```
-
-Проверить, что бинарь доступен:
-
-```bash
-which cratond
-which cratonctl
-```
-
-## Smoke-test
-
-### Демон
-
-```bash
-curl -s http://127.0.0.1:18800/health
+curl -sf http://127.0.0.1:18800/health
 curl -s http://127.0.0.1:18800/api/v1/state | python3 -m json.tool
-```
-
-Ожидаемо:
-
-- `/health` возвращает `200` и `{"status":"ok","reason":"ok"}` на свежем snapshot
-- `/api/v1/state` возвращает JSON object
-
-### CLI
-
-```bash
 cratonctl health
-cratonctl auth status
 cratonctl status
 cratonctl services
 cratonctl doctor
-cratonctl --json history recovery
-```
-
-### Mutating smoke-test
-
-После первого старта проверь token path:
-
-```bash
-ls -l /var/lib/craton/remediation-token
-```
-
-Если нужно проверить доступность mutating path под текущим пользователем:
-
-```bash
 cratonctl auth status
-cratonctl doctor
 ```
 
-Затем попробуй безопасную ручную команду:
+Если нужен mutating smoke-test:
 
 ```bash
 cratonctl maintenance set ntfy --reason "тест после деплоя"
 cratonctl maintenance clear ntfy
 ```
 
-## Проверка journald и watchdog
+## Rollback
 
-```bash
-journalctl -u cratond -n 100 --no-pager
-systemctl show cratond -p WatchdogUSec
-```
-
-`cratond` шлёт `WATCHDOG=1` независимо от due tasks, поэтому watchdog не должен
-зависеть только от очередного recovery tick.
-
-## Проверка backup
-
-Перед первым production backup убедись, что:
-
-- `restic` установлен
-- `backup.restic_repo` доступен
-- `backup.restic_password_file` читается демоном
-- сервисы с `backup_stop = true` реально можно остановить и поднять обратно
-
-Ручной запуск:
-
-```bash
-cratonctl backup run
-cratonctl --json history backup
-```
-
-## Проверка history и diagnose
-
-```bash
-cratonctl history recovery
-cratonctl history backup
-cratonctl history remediation
-cratonctl diagnose ntfy
-```
-
-## Rollback basics
-
-Если новый бинарь ведёт себя плохо:
-
-1. останови сервис
-2. верни предыдущий бинарь `cratond`
-3. при необходимости верни предыдущий `config.toml`
-4. запусти сервис снова
-5. проверь `/health` и `cratonctl status`
-
-Пример:
+Если новый бинарь не проходит smoke-test:
 
 ```bash
 sudo systemctl stop cratond
-sudo install -m 0755 /usr/local/bin/cratond.previous /usr/local/bin/cratond
+sudo cp /usr/local/bin/cratond.previous /usr/local/bin/cratond
+sudo chmod 755 /usr/local/bin/cratond
+sudo cp /usr/local/bin/cratonctl.previous /usr/local/bin/cratonctl
+sudo chmod 755 /usr/local/bin/cratonctl
 sudo systemctl start cratond
-cratonctl health
 ```
 
-Что важно:
-
-- не редактируй вручную `backup-state.json` и `maintenance.json`
-- не удаляй remediation token без необходимости
-- rollback должен идти через бинарник, unit и config, а не через правку state
-
-## Частые проблемы
-
-### Демон не стартует
-
-Проверь:
-
-- `journalctl -u cratond -n 200 --no-pager`
-- валидность `config.toml`
-- существование всех unit из `[[service]]`
-- доступность `restic`
-
-### `cratonctl` не может выполнять mutating-команды
-
-Проверь:
-
-- есть ли `/var/lib/craton/remediation-token`
-- читается ли он нужным пользователем
-- не пустой ли token file
-- совпадает ли `--url`
-- не пытаешься ли использовать `https://`
-
-Начни с:
+После rollback:
 
 ```bash
-cratonctl auth status
-cratonctl doctor
+curl -sf http://127.0.0.1:18800/health
+cratonctl health
+cratonctl status
 ```
 
-`auth status` покажет, какой token path реально проверяет CLI и почему mutating commands недоступны.
-`doctor` дополнит это общей проверкой daemon reachability и API preconditions.
+## Что проверить руками перед production deploy
 
-### `/health` даёт 503
+- корректность `/etc/craton/config.toml`
+- реальные unit names в `[[service]]`
+- доступность `backup.restic_repo`
+- корректность `backup.restic_password_file`
+- права на `/var/lib/craton/remediation-token`
+- что `systemd` unit действительно соответствует окружению
 
-Смотри `reason`:
+## Полезные команды
 
-- `stale_snapshot`
-- `outbox_overflow`
-- `shutting_down`
-
-Это typed сигнал о состоянии control plane демона, а не обязательно о состоянии всех сервисов.
-
+```bash
+sudo systemctl status cratond
+journalctl -u cratond -n 200 --no-pager
+systemctl show cratond -p WatchdogUSec
+cratonctl health
+cratonctl doctor
+cratonctl auth status
+```
